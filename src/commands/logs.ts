@@ -23,6 +23,7 @@ export function registerLogsCommand(
 ): void {
   ctx
     .command('docker.logs <container> [node]', '查看容器日志')
+    .alias('docker日志', '容器日志', 'docker查看日志', '容器查看日志', 'dockerlogs')
     .option('lines', '-n <lines:number> 显示最后 N 行')
     .option('timestamp', '-t 显示时间戳')
     .action(async ({ options }, container, node) => {

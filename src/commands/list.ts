@@ -12,6 +12,7 @@ export function registerListCommand(ctx: Context, getService: () => any, config?
 
   ctx
     .command('docker.ls [selector]', '列出容器')
+    .alias('docker列表', '容器列表', 'dockercs', '容器查看', 'docker查看')
     .option('all', '-a 列出所有容器，包括已停止', { fallback: false })
     .option('format', '-f <format> 输出格式: simple|detail|json|image', {
       fallback: null, // 由 config.imageOutput 决定

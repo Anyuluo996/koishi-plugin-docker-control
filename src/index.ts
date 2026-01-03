@@ -1,20 +1,30 @@
 /**
- * 插件入口 - 简化版，只支持 SSH 直连模式
+ * 插件入口 - 支持订阅机制的 Docker 管理插件
  */
 import { Context, Logger, Schema } from 'koishi'
-import type { DockerControlConfig, NodeConfig, CredentialConfig, NotificationConfig } from './types'
-import { logger, nodeLogger, connectorLogger, monitorLogger, notifierLogger, commandLogger } from './utils/logger'
+import type { DockerControlConfig } from './types'
+import { logger, nodeLogger, commandLogger } from './utils/logger'
 import { DockerService } from './service'
 import { MonitorManager } from './service/monitor'
-import { Notifier } from './service/notifier'
 import { registerCommands } from './commands'
 
 export const name = 'docker-control'
 
-// 声明 puppeteer 为可选依赖
 export const inject = {
   required: ['database'],
   optional: ['puppeteer'],
+}
+
+// 订阅记录类型定义
+interface DockerControlSubscription {
+  id: number
+  platform: string
+  channelId: string
+  nodeId: string
+  containerPattern: string
+  eventTypes: string
+  enabled: boolean
+  createdAt: number
 }
 
 // Puppeteer 类型扩展
@@ -23,6 +33,10 @@ declare module 'koishi' {
     puppeteer?: {
       render: (html: string, callback?: (page: any, next: (handle?: any) => Promise<string>) => Promise<string>) => Promise<string>
     }
+  }
+
+  interface Tables {
+    'docker_control_subscriptions': DockerControlSubscription
   }
 }
 
@@ -49,15 +63,38 @@ export const Config = Schema.object({
     port: Schema.number().default(22).description('SSH 端口'),
     credentialId: Schema.string().required().description('SSH 凭证 ID'),
   })).description('Docker 节点列表'),
-  notification: Schema.object({
-    enabled: Schema.boolean().default(false),
-    level: Schema.union(['all', 'error', 'none'] as const).default('all'),
-    targetGroups: Schema.array(Schema.string()).default([]),
-    events: Schema.array(Schema.string()).default(['container.start', 'container.stop', 'container.restart', 'container.die']),
-  }).description('通知配置'),
 })
 
+// 事件消息模板
+const EVENT_MESSAGES: Record<string, string> = {
+  'container.start': '已启动',
+  'container.stop': '已停止',
+  'container.restart': '已重启',
+  'container.die': '已异常退出',
+}
+
+// 订阅记录类型
+type SubscriptionRecord = DockerControlSubscription
+
 export function apply(ctx: Context, config: DockerControlConfig) {
+  // 表名
+  const TABLE_NAME = 'docker_control_subscriptions'
+
+  // 注册表结构
+  ctx.model.extend(TABLE_NAME, {
+    id: 'unsigned',
+    platform: 'string',
+    channelId: 'string',
+    nodeId: 'string',
+    containerPattern: 'string',
+    eventTypes: 'text',
+    enabled: 'boolean',
+    createdAt: 'integer',
+  }, {
+    autoInc: true,
+    primary: 'id',
+  })
+
   // 安全检查
   if (!config) {
     logger.info('Docker Control 配置未定义，跳过加载')
@@ -89,47 +126,221 @@ export function apply(ctx: Context, config: DockerControlConfig) {
   // 创建服务实例
   const dockerService = new DockerService(ctx, config)
   const monitorManager = new MonitorManager()
-  const notifier = new Notifier(ctx, config.notification || { enabled: false, level: 'all', targetGroups: [], events: [] })
 
-  // 监听节点事件
-  const eventUnsub = dockerService.onNodeEvent((event) => {
-    notifier.send(event.Type as any, event)
-  })
-
-  // 插件就绪时初始化（使用 setTimeout 确保 ctx 完全初始化）
+  // 插件就绪时初始化（异步，不阻塞 Koishi 启动）
   setTimeout(() => {
-    dockerService.initialize()
-      .then(() => {
-        logger.info('Docker Control 插件初始化完成')
-      })
-      .catch((e: any) => {
-        logger.error(`初始化失败: ${e?.message || e}`)
-      })
+    dockerService.initialize().catch((e: any) => {
+      logger.error(`初始化失败: ${e?.message || e}`)
+    })
   }, 0)
 
-  // 注册指令
+  // 注册基础指令
   registerCommands(ctx, () => dockerService, config)
 
-  // 调试指令
+  // ==================== 订阅指令 ====================
+  ctx.command('docker.subscribe <node> <container>', '订阅容器状态变更通知')
+    .alias('docker订阅', '订阅', '容器订阅')
+    .option('events', '-e <events> 监听的事件类型，默认全部', { fallback: 'start,stop,restart,die' })
+    .action(async ({ options, session }, nodeSelector, containerPattern) => {
+      const { platform, channelId } = session
+
+      // 检查服务是否可用
+      if (!dockerService) {
+        return '❌ Docker 服务未初始化'
+      }
+
+      // 验证必填参数
+      if (!nodeSelector || !containerPattern) {
+        return '❌ 缺少参数，用法: docker.subscribe <节点> <容器>\n   示例: docker.subscribe yun myapp\n   示例: docker.subscribe all all'
+      }
+
+      // 验证节点
+      const nodes = dockerService.getNodesBySelector(nodeSelector)
+      if (nodes.length === 0) {
+        return `❌ 找不到节点: ${nodeSelector}`
+      }
+
+      const nodeId = nodeSelector === 'all' ? '' : nodes[0].id
+      const eventTypes = options.events.split(',').map(e => e.trim()).filter(Boolean)
+      const targetContainerPattern = containerPattern === 'all' ? '' : containerPattern
+
+      // 查询是否已存在相同订阅
+      const existing = await ctx.model.get(TABLE_NAME, {
+        platform,
+        channelId,
+        nodeId,
+        containerPattern: targetContainerPattern,
+      })
+
+      if (existing.length > 0) {
+        // 更新已有订阅
+        await ctx.model.set(TABLE_NAME, { id: existing[0].id }, {
+          eventTypes: JSON.stringify(eventTypes),
+          enabled: true,
+        })
+        logger.info(`更新订阅: ${platform}:${channelId} ${nodeId || '*'} ${targetContainerPattern || '*'}`)
+      } else {
+        // 创建新订阅
+        await ctx.database.create(TABLE_NAME, {
+          platform,
+          channelId,
+          nodeId,
+          containerPattern: targetContainerPattern,
+          eventTypes: JSON.stringify(eventTypes),
+          enabled: true,
+          createdAt: Date.now(),
+        })
+        logger.info(`创建订阅: ${platform}:${channelId} ${nodeId || '*'} ${targetContainerPattern || '*'}`)
+      }
+
+      const nodeDesc = nodeSelector === 'all' ? '所有节点' : nodes[0].name
+      const containerDesc = containerPattern === 'all' ? '所有容器' : containerPattern
+
+      return `✅ 已更新订阅\n   节点: ${nodeDesc}\n   容器: ${containerDesc}\n   事件: ${eventTypes.join(', ')}`
+    })
+
+  // 取消订阅
+  ctx.command('docker.unsubscribe <id>', '取消订阅')
+    .alias('docker取消订阅', '取消订阅')
+    .action(async (_, id) => {
+      const subId = Number(id)
+      if (isNaN(subId) || subId <= 0) {
+        return '❌ 请提供有效的订阅 ID，使用 docker订阅列表 查看'
+      }
+      await ctx.model.remove(TABLE_NAME, { id: subId })
+      return `✅ 已取消订阅 ${subId}`
+    })
+
+  // 查看订阅列表
+  ctx.command('docker.subscriptions', '查看当前订阅')
+    .alias('docker订阅列表', '订阅列表')
+    .action(async ({ session }) => {
+      const { platform, channelId } = session
+      const rows = await ctx.model.get(TABLE_NAME, { platform, channelId })
+
+      if (rows.length === 0) {
+        return '暂无订阅，使用 docker.subscribe <节点> <容器> 添加订阅'
+      }
+
+      const lines = ['=== 我的订阅 ===']
+      for (const row of rows as SubscriptionRecord[]) {
+        const nodeDesc = row.nodeId ? `(节点: ${row.nodeId})` : '(所有节点)'
+        const containerDesc = row.containerPattern || '(所有容器)'
+        const eventTypes = JSON.parse(row.eventTypes || '[]')
+        lines.push(`[${row.id}] ${nodeDesc} ${containerDesc}`)
+        lines.push(`    事件: ${eventTypes.join(', ')}`)
+      }
+
+      return lines.join('\n')
+    })
+
+  // ==================== 事件监听 ====================
+  const eventUnsub = dockerService.onNodeEvent(async (event, nodeId) => {
+    // 只处理容器事件
+    if (event.Type !== 'container') return
+
+    const eventAction = event.Action
+    const eventType = `container.${eventAction}`
+    const containerName = event.Actor?.Attributes?.name || ''
+
+    // 获取节点名称
+    const node = dockerService.getNode(nodeId)
+    const nodeName = node?.name || nodeId
+
+    // [调试日志] 收到了事件
+    commandLogger.debug(`[事件处理] 收到事件: [${nodeName}] ${containerName} -> ${eventAction}`)
+
+    // 获取所有订阅并发送通知
+    const subs = await ctx.model.get(TABLE_NAME, {})
+
+    if (subs.length === 0) {
+      commandLogger.debug(`[事件处理] 无订阅`)
+      return
+    }
+
+    commandLogger.debug(`[事件处理] 检查 ${subs.length} 个订阅`)
+
+    for (const sub of subs as SubscriptionRecord[]) {
+      if (!sub.enabled) {
+        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 已禁用`)
+        continue
+      }
+
+      // 1. 检查事件类型
+      const eventTypes = JSON.parse(sub.eventTypes || '[]')
+      if (!eventTypes.includes(eventAction)) {
+        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 事件类型不匹配 (订阅: ${eventTypes.join(', ')}, 收到: ${eventAction})`)
+        continue
+      }
+
+      // 2. 检查节点匹配
+      if (sub.nodeId && sub.nodeId !== nodeId) {
+        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 节点不匹配 (订阅: ${sub.nodeId}, 收到: ${nodeId})`)
+        continue
+      }
+
+      // 3. 检查容器名称匹配
+      if (sub.containerPattern) {
+        const pattern = sub.containerPattern
+          .replace(/\*/g, '.*')
+          .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+        const regex = new RegExp(`^${pattern}$`, 'i')
+
+        if (!regex.test(containerName)) {
+          commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 容器名不匹配 (${containerName} vs ${sub.containerPattern})`)
+          continue
+        }
+      }
+
+      // 构建消息
+      const emoji: Record<string, string> = {
+        start: '🟢',
+        stop: '🔴',
+        restart: '🟡',
+        die: '⚠️',
+        kill: '💀',
+        health_status: '💚',
+      }
+      const actionText = EVENT_MESSAGES[eventType] || eventAction
+      const emojiChar = emoji[eventAction] || '📦'
+      const message = `${emojiChar} 【${nodeName}】${containerName} ${actionText}`
+
+      // 发送
+      try {
+        const bots = ctx.bots.filter(b => b.platform === sub.platform)
+        if (bots.length === 0) {
+          commandLogger.warn(`  - 订阅[${sub.id}] 失败: 找不到平台 ${sub.platform} 的 Bot`)
+          continue
+        }
+        for (const bot of bots) {
+          await bot.sendMessage(sub.channelId, message)
+          commandLogger.info(`[通知] 已推送到 ${sub.channelId}: ${message}`)
+        }
+      } catch (e) {
+        commandLogger.error(`通知发送失败: ${e}`)
+      }
+    }
+  })
+
+  // ==================== 调试指令 ====================
   if (config.debug) {
-    // 设置所有日志器级别为 DEBUG
-    logger.level = 0
-    nodeLogger.level = 0
-    connectorLogger.level = 0
-    monitorLogger.level = 0
-    notifierLogger.level = 0
-    commandLogger.level = 0
-    logger.info('[DEBUG] 调试模式已启用')
+    const debugLevel = (Logger as any).DEBUG || 4
+    logger.level = debugLevel
+    nodeLogger.level = debugLevel
+    commandLogger.level = debugLevel
+    logger.info(`[DEBUG] 调试模式已启用 (Level: ${debugLevel})`)
 
     ctx.command('docker.debug', '调试指令').action(async () => {
       const nodes = dockerService.getAllNodes()
       const online = dockerService.getOnlineNodes()
+      const subs = await ctx.model.get(TABLE_NAME, {})
 
       const lines: string[] = [
         '=== Docker Control 调试信息 ===',
         `节点总数: ${nodes.length}`,
         `在线节点: ${online.length}`,
         `离线节点: ${nodes.length - online.length}`,
+        `订阅总数: ${subs.length}`,
         '',
       ]
 
@@ -137,8 +348,12 @@ export function apply(ctx: Context, config: DockerControlConfig) {
       for (const n of nodes) {
         const status = n.status === 'connected' ? '🟢' : n.status === 'connecting' ? '🟡' : '🔴'
         lines.push(`${status} ${n.name} (${n.id})`)
-        lines.push(`   状态: ${n.status}`)
-        lines.push(`   标签: ${n.tags.join(', ') || '(无)'}`)
+      }
+
+      lines.push('')
+      lines.push('--- 订阅列表 ---')
+      for (const sub of subs as SubscriptionRecord[]) {
+        lines.push(`[${sub.id}] ${sub.platform}:${sub.channelId} ${sub.nodeId || '*'} ${sub.containerPattern || '*'}`)
       }
 
       return lines.join('\n')
@@ -146,4 +361,11 @@ export function apply(ctx: Context, config: DockerControlConfig) {
   }
 
   logger.info('Docker Control 插件已加载')
+
+  // 插件卸载时清理
+  ctx.on('dispose', async () => {
+    logger.info('Docker Control 插件正在卸载...')
+    eventUnsub()
+    await dockerService.stopAll()
+  })
 }

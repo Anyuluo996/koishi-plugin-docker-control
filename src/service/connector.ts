@@ -19,6 +19,32 @@ export class DockerConnector {
    * 执行 SSH 命令
    */
   async exec(command: string): Promise<string> {
+    let lastError: any
+
+    // 自动重试一次
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await this.execInternal(command)
+      } catch (err: any) {
+        lastError = err
+        const msg = err.message || ''
+
+        // 如果是 SSH 通道打开失败，或者是连接已结束，则强制重连
+        if (msg.includes('Channel open failure') || msg.includes('Client ended') || msg.includes('Socket ended')) {
+          connectorLogger.warn(`[${this.config.name}] SSH 连接异常 (${msg})，尝试重连...`)
+          this.dispose() // 强制销毁当前连接
+          continue // 重试
+        }
+
+        // 其他错误直接抛出
+        throw err
+      }
+    }
+
+    throw lastError
+  }
+
+  private async execInternal(command: string): Promise<string> {
     const client = await this.getConnection()
 
     connectorLogger.debug(`[${this.config.name}] 执行命令: ${command}`)
@@ -36,6 +62,12 @@ export class DockerConnector {
 
         stream.on('close', (code: number, signal: string) => {
           connectorLogger.debug(`[${this.config.name}] 命令完成: code=${code}, signal=${signal}`)
+          // 显式结束 stream 防止 channel 泄露
+          try {
+            stream.end()
+          } catch (e) {
+            // 可能已经关闭，忽略错误
+          }
           if (stderr.includes('Error') || stderr.includes('error')) {
             reject(new Error(stderr.trim()))
           } else {
@@ -59,7 +91,8 @@ export class DockerConnector {
    */
   async listContainers(all = true): Promise<string> {
     const flag = all ? '-a' : ''
-    return this.exec(`docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}' ${flag}`)
+    // 使用双引号包裹 format，以兼容 Windows CMD
+    return this.exec(`docker ps -a --format "{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}" ${flag}`)
   }
 
   /**
@@ -97,6 +130,82 @@ export class DockerConnector {
     // 使用 docker exec 需要处理引号
     const escapedCmd = cmd.replace(/'/g, "'\\''")
     return this.exec(`docker exec ${containerId} sh -c '${escapedCmd}'`)
+  }
+
+  /**
+   * 监听 Docker 事件流
+   * @param callback 每行事件数据的回调
+   * @returns 停止监听的方法
+   */
+  async startEventStream(callback: (line: string) => void): Promise<() => void> {
+    const client = await this.getConnection()
+
+    connectorLogger.debug(`[${this.config.name}] 正在启动事件流监听...`)
+
+    return new Promise((resolve, reject) => {
+      client.exec(`docker events --format "{{json .}}" --filter "type=container"`, (err, stream) => {
+        if (err) {
+          connectorLogger.error(`[${this.config.name}] 启动事件流失败: ${err.message}`)
+          reject(err)
+          return
+        }
+
+        connectorLogger.info(`[${this.config.name}] Docker 事件流已连接`)
+        let buffer = ''
+        let closed = false
+
+        const stop = () => {
+          if (!closed) {
+            closed = true
+            try {
+              stream.close()
+            } catch (e) {
+              // 可能已经关闭
+            }
+            connectorLogger.debug(`[${this.config.name}] 主动停止事件流`)
+          }
+        }
+
+        stream.on('close', (code: any, signal: any) => {
+          if (!closed) {
+            closed = true
+            connectorLogger.warn(`[${this.config.name}] 事件流意外断开 (Code: ${code}, Signal: ${signal})`)
+          }
+        })
+
+        stream.on('data', (data: Buffer) => {
+          buffer += data.toString()
+
+          // 按行处理，解决 TCP 粘包问题
+          let newlineIndex
+          while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, newlineIndex).trim()
+            buffer = buffer.slice(newlineIndex + 1)
+            if (line) {
+              callback(line)
+            }
+          }
+        })
+
+        stream.stderr.on('data', (data: Buffer) => {
+          connectorLogger.debug(`[${this.config.name}] 事件流 stderr: ${data.toString().trim()}`)
+        })
+
+        // 存储引用
+        ;(this as any)._eventStream = stream
+
+        resolve(stop)
+      })
+    })
+  }
+
+  private connected = true
+
+  /**
+   * 标记连接状态
+   */
+  setConnected(status: boolean): void {
+    this.connected = status
   }
 
   /**

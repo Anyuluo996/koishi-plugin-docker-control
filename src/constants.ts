@@ -17,8 +17,11 @@ export const MAX_RETRY_COUNT = 3
 // 监控重连间隔 (毫秒)
 export const MONITOR_RETRY_INTERVAL = 30000
 
-// Docker Events 监听间隔 (毫秒)
-export const EVENTS_RECONNECT_INTERVAL = 5000
+// Docker Events 监听间隔 (毫秒) - 已改为流式监听，此常量仅作备用
+export const EVENTS_POLL_INTERVAL = 60000
+
+// 容器状态轮询间隔 (毫秒) - 改为5分钟仅作兜底同步
+export const CONTAINER_POLL_INTERVAL = 5 * 60 * 1000
 
 // 日志行数默认
 export const DEFAULT_LOG_LINES = 100

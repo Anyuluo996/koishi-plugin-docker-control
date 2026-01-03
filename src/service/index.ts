@@ -14,6 +14,8 @@ export class DockerService {
   private nodes: Map<string, DockerNode> = new Map()
   /** 配置 */
   private readonly config: DockerControlConfig
+  /** 全局事件回调集合 - 事件中转站 */
+  private eventCallbacks: Set<(event: DockerEvent, nodeId: string) => void> = new Set()
 
   constructor(ctx: Context, config: DockerControlConfig) {
     this.ctx = ctx
@@ -38,6 +40,13 @@ export class DockerService {
       }
 
       const node = new DockerNode(nodeConfig, credential, this.config.debug)
+
+      // 【关键修复】创建节点时，立即绑定事件转发
+      // 无论 index.ts 何时调用 onNodeEvent，这里都会把事件转发给 eventCallbacks
+      node.onEvent((event) => {
+        this.dispatchGlobalEvent(event, node.id)
+      })
+
       this.nodes.set(nodeConfig.id, node)
       logger.info(`节点已创建: ${nodeConfig.name} (${nodeConfig.id})`)
     }
@@ -65,6 +74,20 @@ export class DockerService {
     ).length
 
     logger.info(`连接完成: ${online} 在线, ${offline} 离线`)
+  }
+
+  /**
+   * 【新增】内部方法：分发全局事件
+   * 将节点事件转发给所有注册的全局回调
+   */
+  private dispatchGlobalEvent(event: DockerEvent, nodeId: string) {
+    for (const callback of this.eventCallbacks) {
+      try {
+        callback(event, nodeId)
+      } catch (e) {
+        logger.error(`事件回调执行错误: ${e}`)
+      }
+    }
   }
 
   getNode(id: string): DockerNode | undefined {
@@ -233,17 +256,17 @@ export class DockerService {
     logger.info('======================')
   }
 
-  onNodeEvent(callback: (event: DockerEvent) => void): () => void {
-    const unsubscribers: (() => void)[] = []
+  /**
+   * 【关键修复】注册全局事件监听
+   * 不再遍历节点，而是添加到全局回调列表
+   * 无论节点何时创建，事件都能通过 dispatchGlobalEvent 转发
+   */
+  onNodeEvent(callback: (event: DockerEvent, nodeId: string) => void): () => void {
+    this.eventCallbacks.add(callback)
 
-    for (const node of this.nodes.values()) {
-      unsubscribers.push(node.onEvent(callback))
-    }
-
+    // 返回取消订阅函数
     return () => {
-      for (const unsub of unsubscribers) {
-        unsub()
-      }
+      this.eventCallbacks.delete(callback)
     }
   }
 
@@ -252,6 +275,7 @@ export class DockerService {
       await node.dispose()
     }
     this.nodes.clear()
+    this.eventCallbacks.clear()
     logger.info('Docker 服务已停止')
   }
 }

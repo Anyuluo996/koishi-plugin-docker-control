@@ -8,7 +8,7 @@ import type {
   NodeStatusType,
   CredentialConfig,
 } from '../types'
-import { NodeStatus, RETRY_INTERVAL, MAX_RETRY_COUNT } from '../constants'
+import { NodeStatus, RETRY_INTERVAL, MAX_RETRY_COUNT, EVENTS_POLL_INTERVAL, CONTAINER_POLL_INTERVAL } from '../constants'
 import { DockerConnector } from './connector'
 import { nodeLogger } from '../utils/logger'
 
@@ -67,6 +67,9 @@ export class DockerNode {
 
         // 测试 SSH 连接和 docker 命令
         await connector.exec('docker version --format "{{.Server.Version}}"')
+
+        // 标记连接可用，允许事件流自动重连
+        connector.setConnected(true)
 
         this.status = NodeStatus.CONNECTED
         nodeLogger.info(`[${this.name}] 连接成功`)
@@ -217,7 +220,7 @@ export class DockerNode {
   }
 
   /**
-   * 启动监控 (容器状态轮询 + 事件监听)
+   * 启动监控 (容器状态轮询 + 事件流监听)
    */
   private startMonitoring(): void {
     this.stopMonitoring()
@@ -225,27 +228,87 @@ export class DockerNode {
     // 初始化容器状态快照
     this.initializeContainerStates()
 
-    // 事件监控：每 5 秒查询 docker events
-    this.eventTimer = setInterval(async () => {
-      if (this.status !== NodeStatus.CONNECTED) return
-      await this.pollEvents()
-    }, 5000)
+    // 事件流监听：使用 docker events 流式获取
+    this.startEventStream()
 
-    // 状态监控：每 30 秒检查容器状态作为备用
+    // 状态监控：每 60 秒检查容器状态并检测变更
+    // (用于捕获可能遗漏的状态变化，以及启动时的初始状态)
     this.monitorTimer = setInterval(async () => {
       if (this.status !== NodeStatus.CONNECTED) return
 
       try {
-        const containers = await this.listContainers(false)
-        const runningCount = containers.filter(c => c.State === 'running').length
-
-        nodeLogger.debug(`[${this.name}] 监控: ${runningCount} 个容器运行中`)
+        const containers = await this.listContainers(true)
+        this.checkContainerStateChanges(containers)
       } catch (e) {
         nodeLogger.warn(`[${this.name}] 监控失败: ${e}`)
       }
-    }, 30000)
+    }, CONTAINER_POLL_INTERVAL)
 
-    nodeLogger.info(`[${this.name}] 监控已启动`)
+    nodeLogger.info(`[${this.name}] 监控已启动 (事件流 + 每 ${CONTAINER_POLL_INTERVAL / 1000} 秒状态检查)`)
+  }
+
+  /**
+   * 启动 Docker 事件流监听
+   */
+  private startEventStream(): void {
+    if (!this.connector) return
+
+    this.connector.startEventStream((line) => {
+      this.handleEventLine(line)
+    }).then((stop) => {
+      ;(this as any)._eventStreamStop = stop
+      nodeLogger.debug(`[${this.name}] 事件流已启动`)
+    }).catch((err) => {
+      nodeLogger.warn(`[${this.name}] 事件流启动失败: ${err.message}，5秒后重试`)
+      setTimeout(() => this.startEventStream(), 5000)
+    })
+  }
+
+  /**
+   * 处理事件流中的一行数据
+   */
+  private handleEventLine(line: string): void {
+    try {
+      const rawEvent = JSON.parse(line)
+      const { Type: type, Action: action, Actor: actor, time, timeNano } = rawEvent
+
+      // 只处理容器相关事件
+      if (type !== 'container') return
+      if (!CONTAINER_ACTIONS.includes(action)) return
+
+      const containerName = actor?.Attributes?.name
+      const image = actor?.Attributes?.image
+
+      // 跳过无法识别名称的容器
+      if (!containerName || containerName === 'unknown') return
+
+      // 更新本地缓存状态，避免下次全量同步时误报
+      // 例如收到 die 事件，就将本地缓存更新为 exited
+      if (actor?.ID) {
+        const inferredState = (action === 'start' || action === 'restart') ? 'running' : 'stopped'
+        this.lastContainerStates.set(actor.ID, inferredState)
+      }
+
+      const event: DockerEvent = {
+        Type: type,
+        Action: action,
+        Actor: {
+          ID: actor?.ID || '',
+          Attributes: {
+            name: containerName,
+            image: image || '',
+          },
+        },
+        scope: 'local',
+        time: time ? time * 1000 : Date.now(),
+        timeNano: timeNano || Date.now() * 1e6,
+      }
+
+      nodeLogger.debug(`[${this.name}] 事件流: ${containerName} ${action}`)
+      this.emitEvent(event)
+    } catch (e) {
+      // 忽略非 JSON 行
+    }
   }
 
   /**
@@ -266,6 +329,57 @@ export class DockerNode {
   }
 
   /**
+   * 检测容器状态变更并发送通知
+   */
+  private checkContainerStateChanges(containers: ContainerInfo[]): void {
+    const runningCount = containers.filter(c => c.State === 'running').length
+    nodeLogger.debug(`[${this.name}] 监控: ${runningCount} 个容器运行中`)
+
+    for (const c of containers) {
+      const lastState = this.lastContainerStates.get(c.Id)
+      const currentState = c.State
+
+      // 状态发生变化
+      if (lastState !== undefined && lastState !== currentState) {
+        const containerName = c.Names[0]?.replace('/', '') || c.Id.slice(0, 8)
+
+        // 推断操作类型
+        let action: string
+        if (lastState !== 'running' && currentState === 'running') {
+          action = 'start'
+        } else if (lastState === 'running' && currentState !== 'running') {
+          action = 'stop'
+        } else {
+          action = currentState
+        }
+
+        nodeLogger.info(`[${this.name}] 状态变更: ${containerName} ${lastState} -> ${currentState}`)
+
+        // 发送事件通知
+        const event: DockerEvent = {
+          Type: 'container',
+          Action: action,
+          Actor: {
+            ID: c.Id,
+            Attributes: {
+              name: containerName,
+              image: c.Image,
+            },
+          },
+          scope: 'local',
+          time: Date.now(),
+          timeNano: Date.now() * 1e6,
+        }
+
+        this.emitEvent(event)
+      }
+
+      // 更新状态快照
+      this.lastContainerStates.set(c.Id, currentState)
+    }
+  }
+
+  /**
    * 轮询 Docker 事件
    */
   private async pollEvents(): Promise<void> {
@@ -273,8 +387,9 @@ export class DockerNode {
 
     try {
       // 查询指定时间之后的事件
+      // 查询指定时间之后的事件 - 使用 JSON 格式以避免解析问题
       const since = new Date(this.lastEventTime).toISOString()
-      const output = await this.connector.exec(`docker events --since "${since}" --format "{{.Type}}|{{.Action}}|{{.Actor.ID}}|{{.Actor.Attributes.name}}|{{.Actor.Attributes.image}}|{{.time}}" --filter "type=container"`)
+      const output = await this.connector.exec(`docker events --since "${since}" --format "{{json .}}" --filter "type=container"`)
 
       this.lastEventTime = Date.now()
 
@@ -282,35 +397,40 @@ export class DockerNode {
 
       const lines = output.split('\n').filter(Boolean)
       for (const line of lines) {
-        const parts = line.split('|')
-        if (parts.length < 6) continue
+        try {
+          const rawEvent = JSON.parse(line)
+          const { Type: type, Action: action, Actor: actor, time, timeNano } = rawEvent
 
-        const [type, action, actorId, containerName, image, timeStr] = parts
+          // 只处理容器相关事件
+          if (type !== 'container') continue
+          if (!CONTAINER_ACTIONS.includes(action)) continue
 
-        // 只处理容器相关事件
-        if (type !== 'container') continue
-        if (!CONTAINER_ACTIONS.includes(action)) continue
+          const containerName = actor?.Attributes?.name
+          const image = actor?.Attributes?.image
 
-        // 跳过无法识别名称的容器
-        if (!containerName || containerName === 'unknown') continue
+          // 跳过无法识别名称的容器
+          if (!containerName || containerName === 'unknown') continue
 
-        const event: DockerEvent = {
-          Type: type,
-          Action: action,
-          Actor: {
-            ID: actorId,
-            Attributes: {
-              name: containerName,
-              image: image || '',
+          const event: DockerEvent = {
+            Type: type,
+            Action: action,
+            Actor: {
+              ID: actor?.ID || '',
+              Attributes: {
+                name: containerName,
+                image: image || '',
+              },
             },
-          },
-          scope: 'local',
-          time: parseInt(timeStr) || Date.now(),
-          timeNano: (parseInt(timeStr) || Date.now()) * 1e6,
-        }
+            scope: 'local',
+            time: time ? time * 1000 : Date.now(), // docker event time is usually unix timestamp (seconds)
+            timeNano: timeNano || Date.now() * 1e6,
+          }
 
-        nodeLogger.debug(`[${this.name}] 事件: ${containerName} ${action}`)
-        this.emitEvent(event)
+          nodeLogger.debug(`[${this.name}] 事件: ${containerName} ${action}`)
+          this.emitEvent(event)
+        } catch (e) {
+          nodeLogger.warn(`[${this.name}] 解析事件失败: ${e} (Line: ${line})`)
+        }
       }
     } catch (e) {
       // 忽略事件查询错误（可能是没有新事件）
@@ -322,13 +442,24 @@ export class DockerNode {
    * 停止监控
    */
   private stopMonitoring(): void {
+    // 停止状态轮询
     if (this.monitorTimer) {
       clearInterval(this.monitorTimer)
       this.monitorTimer = null
     }
+    // 停止事件流
+    if ((this as any)._eventStreamStop) {
+      ;(this as any)._eventStreamStop()
+      ;(this as any)._eventStreamStop = null
+    }
+    // 停止重试定时器
     if (this.eventTimer) {
-      clearInterval(this.eventTimer)
+      clearTimeout(this.eventTimer)
       this.eventTimer = null
+    }
+    // 标记连接断开，防止自动重连
+    if (this.connector) {
+      this.connector.setConnected(false)
     }
   }
 

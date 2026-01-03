@@ -104,3 +104,24 @@ export interface DockerEvent {
   time: number
   timeNano: number
 }
+
+// ==================== 订阅配置 ====================
+
+export interface SubscriptionConfig {
+  /** 订阅 ID */
+  id?: number
+  /** 平台 (onebot 等) */
+  platform: string
+  /** 频道 ID (群组号或用户号) */
+  channelId: string
+  /** 节点 ID (空表示所有节点) */
+  nodeId?: string
+  /** 容器名称模式 (空表示所有容器，支持 * 通配符) */
+  containerPattern?: string
+  /** 推送的事件类型 */
+  eventTypes: string[]
+  /** 是否启用 */
+  enabled: boolean
+  /** 创建时间 */
+  createdAt?: number
+}

@@ -36,7 +36,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
   /**
    * 查看节点列表
    */
-  ctx.command('docker.nodes', '查看节点').action(async () => {
+  ctx.command('docker.nodes', '查看节点').alias('docker节点', '容器节点').action(async () => {
     const service = getService()
     if (!service) {
       return 'Docker 服务未初始化'
@@ -72,6 +72,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
    */
   ctx
     .command('docker.node <selector>', '查看节点详情')
+    .alias('docker节点详情', '容器节点详情')
     .action(async (_, selector) => {
       const service = getService()
       if (!service) {
@@ -110,6 +111,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
    */
   ctx
     .command('docker.find <container>', '搜索容器')
+    .alias('docker查找', '容器查找', 'docker搜索', '容器搜索')
     .option('all', '-a 包含已停止的容器', { fallback: false })
     .action(async ({ options }, container) => {
       const service = getService()
@@ -143,6 +145,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
    */
   ctx
     .command('docker.exec <container> <cmd>', '在容器中执行命令')
+    .alias('docker执行', '容器执行', 'dockerexec', 'dockercmd', 'docker命令', '容器命令')
     .option('node', '-n <node> 指定节点', { fallback: '' })
     .action(async ({ options }, container, cmd) => {
       const service = getService()
@@ -190,6 +193,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
    */
   ctx
     .command('docker.shell <container> <cmd>', '在容器中执行命令(交互式)')
+    .alias('dockershell', '容器shell')
     .option('node', '-n <node> 指定节点', { fallback: '' })
     .option('timeout', '-t <seconds> 超时时间', { fallback: 30 })
     .action(async ({ options }, container, cmd) => {
@@ -236,7 +240,7 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
   /**
    * 查看帮助
    */
-  ctx.command('docker.help', '查看帮助').action(async () => {
+  ctx.command('docker.help', '查看帮助').alias('docker帮助', 'docker帮助', '容器帮助').action(async () => {
     return [
       '=== Docker Control 帮助 ===',
       '',
