@@ -4,6 +4,7 @@
  */
 import { Command, Context } from 'koishi'
 import { commandLogger } from '../utils/logger'
+import { generateResultHtml, generateInspectHtml, renderToImage } from '../utils/render'
 
 /**
  * 格式化容器搜索结果
@@ -38,8 +39,10 @@ function formatSearchResults(
  */
 export function registerControlCommands(
   ctx: Context,
-  getService: () => any
+  getService: () => any,
+  config?: any
 ): void {
+  const useImageOutput = config?.imageOutput === true
   /**
    * 启动容器
    */
@@ -64,6 +67,12 @@ export function registerControlCommands(
             container,
             'start'
           )
+
+          if (useImageOutput && ctx.puppeteer) {
+            const html = generateResultHtml(results, '批量启动结果')
+            return await renderToImage(ctx, html)
+          }
+
           return formatSearchResults(results, '启动')
         }
 
@@ -78,10 +87,21 @@ export function registerControlCommands(
         await node.startContainer(found.Id)
         commandLogger.debug(`容器已启动: ${found.Id}`)
 
+        if (useImageOutput && ctx.puppeteer) {
+          const results = [{ node, container: found, success: true }]
+          const html = generateResultHtml(results, '启动成功')
+          return await renderToImage(ctx, html)
+        }
+
         const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
         return `✅ ${node.name}: ${name} 已启动`
       } catch (e: any) {
         commandLogger.error(`启动容器失败: ${e.message}`)
+        if (useImageOutput && ctx.puppeteer) {
+          // 尝试构造一个失败的结果用于渲染，虽然这里可能没有 node/container 信息
+          // 如果找不到容器，e 可能是 "找不到容器"
+          return `❌ 启动失败: ${e.message}`
+        }
         return `❌ 启动失败: ${e.message}`
       }
     })
@@ -110,6 +130,12 @@ export function registerControlCommands(
             container,
             'stop'
           )
+
+          if (useImageOutput && ctx.puppeteer) {
+            const html = generateResultHtml(results, '批量停止结果')
+            return await renderToImage(ctx, html)
+          }
+
           return formatSearchResults(results, '停止')
         }
 
@@ -122,6 +148,12 @@ export function registerControlCommands(
 
         await node.stopContainer(found.Id)
         commandLogger.debug(`容器已停止: ${found.Id}`)
+
+        if (useImageOutput && ctx.puppeteer) {
+          const results = [{ node, container: found, success: true }]
+          const html = generateResultHtml(results, '停止成功')
+          return await renderToImage(ctx, html)
+        }
 
         const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
         return `✅ ${node.name}: ${name} 已停止`
@@ -155,6 +187,12 @@ export function registerControlCommands(
             container,
             'restart'
           )
+
+          if (useImageOutput && ctx.puppeteer) {
+            const html = generateResultHtml(results, '批量重启结果')
+            return await renderToImage(ctx, html)
+          }
+
           return formatSearchResults(results, '重启')
         }
 
@@ -167,6 +205,12 @@ export function registerControlCommands(
 
         await node.restartContainer(found.Id)
         commandLogger.debug(`容器已重启: ${found.Id}`)
+
+        if (useImageOutput && ctx.puppeteer) {
+          const results = [{ node, container: found, success: true }]
+          const html = generateResultHtml(results, '重启成功')
+          return await renderToImage(ctx, html)
+        }
 
         const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
         return `✅ ${node.name}: ${name} 已重启`
@@ -195,6 +239,11 @@ export function registerControlCommands(
         )
 
         const info = await node.getContainer(found.Id)
+
+        if (useImageOutput && ctx.puppeteer) {
+          const html = generateInspectHtml(node.name, info)
+          return await renderToImage(ctx, html)
+        }
 
         const lines = [
           `名称: ${info.Name.replace('/', '')}`,

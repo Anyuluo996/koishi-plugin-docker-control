@@ -6,6 +6,7 @@ import type { DockerControlConfig } from '../types'
 import { registerListCommand } from './list'
 import { registerControlCommands } from './control'
 import { registerLogsCommand } from './logs'
+import { generateNodesHtml, generateNodeDetailHtml, renderToImage } from '../utils/render'
 
 /**
  * 获取服务的回调类型
@@ -22,17 +23,18 @@ export function registerCommands(
 ): void {
   // 注册各模块指令
   registerListCommand(ctx, getService, config)
-  registerControlCommands(ctx, getService)
+  registerControlCommands(ctx, getService, config)
   registerLogsCommand(ctx, getService, config)
 
   // 注册辅助指令
-  registerHelperCommands(ctx, getService)
+  registerHelperCommands(ctx, getService, config)
 }
 
 /**
  * 注册辅助指令
  */
-function registerHelperCommands(ctx: Context, getService: GetService): void {
+function registerHelperCommands(ctx: Context, getService: GetService, config?: any): void {
+  const useImageOutput = config?.imageOutput === true
   /**
    * 查看节点列表
    */
@@ -47,21 +49,27 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
       return '未配置任何节点'
     }
 
+    const online = nodes.filter((n) => n.status === 'connected').length
+
+    if (useImageOutput && ctx.puppeteer) {
+      const html = generateNodesHtml(nodes)
+      return await renderToImage(ctx, html)
+    }
+
     const lines = ['=== Docker 节点 ===']
     for (const node of nodes) {
       const statusIcon =
         node.status === 'connected'
           ? '🟢'
           : node.status === 'connecting'
-          ? '🟡'
-          : '🔴'
+            ? '🟡'
+            : '🔴'
       const tags = node.tags.length > 0 ? ` [@${node.tags.join(' @')}]` : ''
       lines.push(
         `${statusIcon} ${node.name} (${node.id})${tags} - ${node.status}`
       )
     }
 
-    const online = nodes.filter((n) => n.status === 'connected').length
     lines.push(`\n总计: ${nodes.length} 个节点，${online} 个在线`)
 
     return lines.join('\n')
@@ -88,6 +96,11 @@ function registerHelperCommands(ctx: Context, getService: GetService): void {
 
       try {
         const version = await node.getVersion()
+
+        if (useImageOutput && ctx.puppeteer) {
+          const html = generateNodeDetailHtml(node, version)
+          return await renderToImage(ctx, html)
+        }
 
         const lines = [
           `=== ${node.name} ===`,

@@ -44,7 +44,7 @@ declare module 'koishi' {
 export const Config = Schema.object({
   requestTimeout: Schema.number().default(30000).description('请求超时 (毫秒)'),
   debug: Schema.boolean().default(false).description('调试模式'),
-  imageOutput: Schema.boolean().default(false).description('使用图片格式输出容器列表'),
+  imageOutput: Schema.boolean().default(false).description('使用图片格式输出容器列表和操作结果'),
   defaultLogLines: Schema.number().default(100).description('默认日志显示的行数'),
   // 监控策略
   monitor: Schema.object({

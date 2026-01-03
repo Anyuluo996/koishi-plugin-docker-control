@@ -188,6 +188,32 @@ export class DockerNode {
   }
 
   /**
+   * 获取 Docker 版本信息
+   */
+  async getVersion(): Promise<{ Version: string; ApiVersion: string; Os: string; Arch: string; KernelVersion: string }> {
+    if (!this.connector) throw new Error('未连接')
+    const output = await this.connector.exec('docker version --format "{{json .Server}}"')
+    const info = JSON.parse(output)
+    return {
+      Version: info.Version || 'unknown',
+      ApiVersion: info.ApiVersion || 'unknown',
+      Os: info.Os || 'unknown',
+      Arch: info.Arch || 'unknown',
+      KernelVersion: info.KernelVersion || 'unknown',
+    }
+  }
+
+  /**
+   * 获取容器详细信息 (docker inspect)
+   */
+  async getContainer(containerId: string): Promise<any> {
+    if (!this.connector) throw new Error('未连接')
+    const output = await this.connector.exec(`docker inspect ${containerId}`)
+    const info = JSON.parse(output)
+    return Array.isArray(info) ? info[0] : info
+  }
+
+  /**
    * 解析 docker ps 输出
    */
   private parseContainerList(output: string): ContainerInfo[] {

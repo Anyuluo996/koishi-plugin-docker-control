@@ -5,6 +5,7 @@
 import { Command, Context, Fragment, h, Session } from 'koishi'
 import type { ContainerInfo } from '../types'
 import { commandLogger } from '../utils/logger'
+import { generateListHtml, renderToImage } from '../utils/render'
 
 export function registerListCommand(ctx: Context, getService: () => any, config?: any): void {
   // 检查是否启用了图片输出
@@ -46,19 +47,9 @@ export function registerListCommand(ctx: Context, getService: () => any, config?
             return '未发现任何容器'
           }
 
-          // 生成 HTML
-          const html = generateHtml(results)
-          // 渲染图片 (puppeteer.render 返回的是 h.image() 元素的字符串)
-          commandLogger.debug('渲染图片中...')
-          const imageElement = await ctx.puppeteer.render(html, async (page, next) => {
-            await page.setViewport({ width: 600, height: 800 })
-            const body = await page.$('body')
-            const clip = await body.boundingBox()
-            const buffer = await page.screenshot({ clip })
-            return h.image(buffer, 'image/png').toString()
-          })
-
-          return imageElement
+          // 生成并渲染
+          const html = generateListHtml(results, selector ? `容器列表 (${selector})` : '容器列表')
+          return await renderToImage(ctx, html)
         } catch (e: any) {
           commandLogger.error(`图片渲染失败: ${e.message}`)
           return `错误: ${e.message}`
@@ -143,154 +134,4 @@ function formatContainerLine(container: ContainerInfo, format: string): string {
 
   // simple 模式：双行显示
   return `${emoji} ${name}\n    └ ${shortId} | ${image}`
-}
-
-/**
- * 生成 HTML 模板
- */
-function generateHtml(results: Array<{ node: any; containers: ContainerInfo[] }>): string {
-  const styles = `
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-      min-height: 100vh;
-      padding: 20px;
-      color: #fff;
-    }
-    .container {
-      max-width: 700px;
-      margin: 0 auto;
-    }
-    .node-section {
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 12px;
-      margin-bottom: 20px;
-      overflow: hidden;
-    }
-    .node-header {
-      background: rgba(79, 172, 254, 0.3);
-      padding: 12px 16px;
-      font-size: 16px;
-      font-weight: 600;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-    }
-    .table-header {
-      display: grid;
-      grid-template-columns: 40px 1fr 100px 1fr;
-      gap: 10px;
-      padding: 10px 16px;
-      background: rgba(0, 0, 0, 0.2);
-      font-size: 12px;
-      color: rgba(255, 255, 255, 0.6);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .row {
-      display: grid;
-      grid-template-columns: 40px 1fr 100px 1fr;
-      gap: 10px;
-      padding: 10px 16px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-      align-items: center;
-      transition: background 0.2s;
-    }
-    .row:hover {
-      background: rgba(255, 255, 255, 0.05);
-    }
-    .row:last-child {
-      border-bottom: none;
-    }
-    .status {
-      font-size: 18px;
-      text-align: center;
-    }
-    .name {
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .id {
-      font-family: 'SF Mono', Monaco, monospace;
-      font-size: 12px;
-      color: rgba(255, 255, 255, 0.7);
-    }
-    .image {
-      font-size: 12px;
-      color: rgba(255, 255, 255, 0.7);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .running { color: #4ade80; }
-    .stopped { color: #f87171; }
-    .other { color: #94a3b8; }
-    .stats {
-      display: flex;
-      justify-content: center;
-      gap: 20px;
-      padding: 16px;
-      color: rgba(255, 255, 255, 0.6);
-      font-size: 13px;
-    }
-  `
-
-  let html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>${styles}</style></head><body>`
-  html += `<div class="container">`
-
-  let totalRunning = 0
-  let totalStopped = 0
-
-  for (const { node, containers } of results) {
-    const running = containers.filter(c => c.State === 'running').length
-    const stopped = containers.length - running
-    totalRunning += running
-    totalStopped += stopped
-
-    html += `<div class="node-section">`
-    html += `<div class="node-header">${node.name}</div>`
-
-    // 表头
-    html += `<div class="table-header">
-      <span></span>
-      <span>容器</span>
-      <span>ID</span>
-      <span>镜像</span>
-    </div>`
-
-    // 容器列表
-    for (const c of containers) {
-      const status = c.State
-      const emoji = status === 'running' ? '🟢' : (status === 'stopped' ? '🔴' : '⚪')
-      const name = c.Names[0]?.replace('/', '') || 'Unknown'
-      const shortId = c.Id.slice(0, 8)
-
-      let image = c.Image
-      const parts = image.split('/')
-      if (parts.length > 1) {
-        image = parts[parts.length - 1]
-      }
-
-      html += `<div class="row">
-        <span class="status">${emoji}</span>
-        <span class="name" title="${name}">${name}</span>
-        <span class="id">${shortId}</span>
-        <span class="image" title="${image}">${image}</span>
-      </div>`
-    }
-
-    // 统计
-    html += `<div class="stats">运行中: ${running} | 已停止: ${stopped}</div>`
-    html += `</div>`
-  }
-
-  // 总体统计
-  html += `<div class="node-section">`
-  html += `<div class="stats"><strong>总计:</strong> ${totalRunning} 运行中, ${totalStopped} 已停止</div>`
-  html += `</div>`
-
-  html += `</div></body></html>`
-
-  return html
 }
