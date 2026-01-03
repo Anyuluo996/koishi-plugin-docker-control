@@ -46,6 +46,12 @@ export const Config = Schema.object({
   debug: Schema.boolean().default(false).description('调试模式'),
   imageOutput: Schema.boolean().default(false).description('使用图片格式输出容器列表'),
   defaultLogLines: Schema.number().default(100).description('默认日志显示的行数'),
+  // 监控策略
+  monitor: Schema.object({
+    debounceWait: Schema.number().default(60000).description('容器意外停止后等待重启的时间 (ms)，在此期间恢复不发送通知'),
+    flappingWindow: Schema.number().default(300000).description('检测抖动/频繁重启的时间窗口 (ms)'),
+    flappingThreshold: Schema.number().default(3).description('时间窗口内允许的最大状态变更次数，超过则报警'),
+  }).description('监控策略设置'),
   credentials: Schema.array(Schema.object({
     id: Schema.string().required(),
     name: Schema.string().required(),
@@ -71,6 +77,7 @@ const EVENT_MESSAGES: Record<string, string> = {
   'container.stop': '已停止',
   'container.restart': '已重启',
   'container.die': '已异常退出',
+  'container.flapping': '运行状态不稳定 (频繁重启)',
 }
 
 // 订阅记录类型
@@ -125,7 +132,8 @@ export function apply(ctx: Context, config: DockerControlConfig) {
 
   // 创建服务实例
   const dockerService = new DockerService(ctx, config)
-  const monitorManager = new MonitorManager()
+  // 传入监控配置
+  const monitorManager = new MonitorManager(config.monitor || {})
 
   // 插件就绪时初始化（异步，不阻塞 Koishi 启动）
   setTimeout(() => {
@@ -235,47 +243,50 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     })
 
   // ==================== 事件监听 ====================
-  const eventUnsub = dockerService.onNodeEvent(async (event, nodeId) => {
-    // 只处理容器事件
-    if (event.Type !== 'container') return
 
-    const eventAction = event.Action
-    const eventType = `container.${eventAction}`
-    const containerName = event.Actor?.Attributes?.name || ''
-
-    // 获取节点名称
+  // 1. 将 DockerService 的原始事件喂给 MonitorManager
+  dockerService.onNodeEvent((event, nodeId) => {
     const node = dockerService.getNode(nodeId)
-    const nodeName = node?.name || nodeId
+    if (node) {
+      monitorManager.processEvent(node, event)
+    }
+  })
 
-    // [调试日志] 收到了事件
-    commandLogger.debug(`[事件处理] 收到事件: [${nodeName}] ${containerName} -> ${eventAction}`)
+  // 2. 监听 MonitorManager 处理后的"智能"事件
+  const eventUnsub = monitorManager.onProcessedEvent(async (processedEvent) => {
+    const { eventType, action, nodeName, containerName, nodeId } = processedEvent
+
+    // [调试日志]
+    commandLogger.debug(`[推送] 准备发送通知: [${nodeName}] ${containerName} -> ${action}`)
 
     // 获取所有订阅并发送通知
     const subs = await ctx.model.get(TABLE_NAME, {})
 
     if (subs.length === 0) {
-      commandLogger.debug(`[事件处理] 无订阅`)
+      commandLogger.debug(`[推送] 无订阅`)
       return
     }
 
-    commandLogger.debug(`[事件处理] 检查 ${subs.length} 个订阅`)
-
     for (const sub of subs as SubscriptionRecord[]) {
-      if (!sub.enabled) {
-        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 已禁用`)
-        continue
-      }
+      if (!sub.enabled) continue
 
       // 1. 检查事件类型
       const eventTypes = JSON.parse(sub.eventTypes || '[]')
-      if (!eventTypes.includes(eventAction)) {
-        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 事件类型不匹配 (订阅: ${eventTypes.join(', ')}, 收到: ${eventAction})`)
+
+      // 特殊逻辑：如果订阅了 'restart' 或 'die'，通常也希望能收到 'flapping' 报警
+      const effectiveEventTypes = [...eventTypes]
+      if (effectiveEventTypes.includes('die') || effectiveEventTypes.includes('restart')) {
+        effectiveEventTypes.push('flapping')
+      }
+
+      if (!effectiveEventTypes.includes(action)) {
+        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 事件类型不匹配 (订阅: ${eventTypes.join(', ')}, 收到: ${action})`)
         continue
       }
 
       // 2. 检查节点匹配
       if (sub.nodeId && sub.nodeId !== nodeId) {
-        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 节点不匹配 (订阅: ${sub.nodeId}, 收到: ${nodeId})`)
+        commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 节点不匹配`)
         continue
       }
 
@@ -287,7 +298,7 @@ export function apply(ctx: Context, config: DockerControlConfig) {
         const regex = new RegExp(`^${pattern}$`, 'i')
 
         if (!regex.test(containerName)) {
-          commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 容器名不匹配 (${containerName} vs ${sub.containerPattern})`)
+          commandLogger.debug(`  - 订阅[${sub.id}] 忽略: 容器名不匹配`)
           continue
         }
       }
@@ -298,11 +309,12 @@ export function apply(ctx: Context, config: DockerControlConfig) {
         stop: '🔴',
         restart: '🟡',
         die: '⚠️',
+        flapping: '💥',
         kill: '💀',
         health_status: '💚',
       }
-      const actionText = EVENT_MESSAGES[eventType] || eventAction
-      const emojiChar = emoji[eventAction] || '📦'
+      const actionText = EVENT_MESSAGES[eventType] || action
+      const emojiChar = emoji[action] || '📦'
       const message = `${emojiChar} 【${nodeName}】${containerName} ${actionText}`
 
       // 发送

@@ -50,6 +50,14 @@ export type NotificationEventType =
   | 'node.offline'
   | 'node.error'
 
+// ==================== 监控策略配置 ====================
+
+export interface MonitorConfig {
+  debounceWait: number  // 防抖等待时间 (ms)
+  flappingWindow: number  // 抖动检测时间窗口 (ms)
+  flappingThreshold: number  // 抖动阈值 (次数)
+}
+
 // ==================== 完整配置 ====================
 
 export interface DockerControlConfig {
@@ -57,6 +65,7 @@ export interface DockerControlConfig {
   debug: boolean
   imageOutput: boolean
   defaultLogLines: number
+  monitor: MonitorConfig
   credentials: CredentialConfig[]
   nodes: NodeConfig[]
   notification: NotificationConfig

@@ -1,229 +1,187 @@
 /**
- * 监控器
- * 处理 Docker Events 流与健康状态
+ * 监控器 - 智能事件处理
+ * 实现防抖、抖动检测
  */
-import type { DockerEvent, NotificationEventType } from '../types'
+import type { DockerEvent, ContainerInfo } from '../types'
 import { DockerNode } from './node'
 import { monitorLogger } from '../utils/logger'
 
-/**
- * 容器事件类型映射
- */
-const EVENT_ACTION_MAP: Record<string, NotificationEventType> = {
-  start: 'container.start',
-  stop: 'container.stop',
-  restart: 'container.restart',
-  die: 'container.die',
-  health_status: 'container.health_status',
+// 容器状态记录
+interface ContainerState {
+  // 防抖定时器：用于延迟发送 Stop/Die 事件
+  stopTimer?: NodeJS.Timeout
+  // 状态变更历史：用于检测频繁重启 (存储时间戳)
+  history: number[]
+  // 上次启动时间，用于屏蔽紧随其后的 restart 事件
+  lastStartTime?: number
 }
 
-/**
- * 防抖状态
- */
-interface DebounceState {
+// 处理后的事件数据结构
+export interface ProcessedEvent {
+  eventType: string // 'container.start', 'container.flapping'
+  action: string    // 'start', 'stop', 'die', 'flapping'
+  nodeId: string
+  nodeName: string
   containerId: string
-  action: string
-  timer: NodeJS.Timeout
-  count: number
+  containerName: string
+  timestamp: number
 }
 
-export class DockerMonitor {
-  /** 节点 */
-  private readonly node: DockerNode
-  /** 防抖状态映射 */
-  private debounceMap: Map<string, DebounceState> = new Map()
-  /** 防抖时间 (毫秒) */
-  private readonly debounceTime: number
-  /** 事件回调 */
-  private eventCallback?: (event: NotificationEventType, data: any) => void
-
-  constructor(node: DockerNode, options: { debounceTime?: number } = {}) {
-    this.node = node
-    this.debounceTime = options.debounceTime ?? 3000
-  }
-
-  /**
-   * 开始监控
-   */
-  start(): void {
-    this.node.onEvent((event) => {
-      this.handleEvent(event)
-    })
-    monitorLogger.debug(`[${this.node.name}] 监控已启动`)
-  }
-
-  /**
-   * 停止监控
-   */
-  stop(): void {
-    this.clearDebounce()
-    monitorLogger.debug(`[${this.node.name}] 监控已停止`)
-  }
-
-  /**
-   * 设置事件回调
-   */
-  onEvent(callback: (event: NotificationEventType, data: any) => void): void {
-    this.eventCallback = callback
-  }
-
-  /**
-   * 处理事件
-   */
-  private handleEvent(event: DockerEvent): void {
-    if (event.Type !== 'container') {
-      return
-    }
-
-    const action = event.Actor.Attributes?.action || event.Action
-    const containerName = event.Actor.Attributes?.name || 'unknown'
-    const containerId = event.Actor.ID
-
-    // 映射到通知事件类型
-    const eventType = EVENT_ACTION_MAP[action]
-    if (!eventType) {
-      monitorLogger.debug(`[${this.node.name}] 忽略事件: ${action}`)
-      return
-    }
-
-    // 防抖处理
-    if (this.shouldDebounce(action, containerId)) {
-      monitorLogger.debug(`[${this.node.name}] 事件防抖: ${containerName} ${action}`)
-      return
-    }
-
-    const data = {
-      nodeId: this.node.id,
-      nodeName: this.node.name,
-      containerId,
-      containerName,
-      action,
-      attributes: event.Actor.Attributes,
-      timestamp: event.time,
-    }
-
-    monitorLogger.debug(`[${this.node.name}] 事件: ${containerName} ${action}`)
-
-    // 触发回调
-    if (this.eventCallback) {
-      try {
-        this.eventCallback(eventType, data)
-      } catch (e) {
-        monitorLogger.error(`[${this.node.name}] 事件回调错误: ${e}`)
-      }
-    }
-  }
-
-  /**
-   * 判断是否应该防抖
-   */
-  private shouldDebounce(action: string, containerId: string): boolean {
-    // 只对 start+stop 这种连续操作进行防抖
-    const debouncePairs: Record<string, string[]> = {
-      stop: ['start'],
-      start: ['stop'],
-    }
-
-    const opposingActions = debouncePairs[action]
-    if (!opposingActions) {
-      return false
-    }
-
-    const key = containerId
-    const existing = this.debounceMap.get(key)
-
-    if (existing && opposingActions.includes(existing.action)) {
-      // 清除之前的防抖定时器
-      clearTimeout(existing.timer)
-      this.debounceMap.delete(key)
-
-      // 合并为重启事件
-      monitorLogger.debug(`[${this.node.name}] 检测到连续操作，合并为重启: ${containerId}`)
-      return true // 阻止第二个事件
-    }
-
-    // 设置新的防抖状态
-    const state: DebounceState = {
-      containerId,
-      action,
-      timer: setTimeout(() => {
-        this.debounceMap.delete(key)
-      }, this.debounceTime),
-      count: 1,
-    }
-
-    this.debounceMap.set(key, state)
-    return false
-  }
-
-  /**
-   * 清除所有防抖定时器
-   */
-  private clearDebounce(): void {
-    for (const state of this.debounceMap.values()) {
-      clearTimeout(state.timer)
-    }
-    this.debounceMap.clear()
-  }
-}
-
-/**
- * 监控管理器
- * 管理所有节点的监控
- */
 export class MonitorManager {
-  /** 监控实例映射 */
-  private monitors: Map<string, DockerMonitor> = new Map()
-  /** 全局事件回调 */
-  private globalCallback?: (event: NotificationEventType, data: any) => void
+  /** 容器状态映射: nodeId -> containerId -> State */
+  private states: Map<string, Map<string, ContainerState>> = new Map()
+  /** 全局回调 */
+  private callback?: (event: ProcessedEvent) => void
+
+  constructor(
+    private config: {
+      debounceWait?: number
+      flappingWindow?: number
+      flappingThreshold?: number
+    } = {}
+  ) {}
 
   /**
-   * 注册节点监控
+   * 处理原始 Docker 事件
    */
-  register(node: DockerNode): void {
-    if (this.monitors.has(node.id)) {
-      this.unregister(node.id)
-    }
+  processEvent(node: DockerNode, event: DockerEvent): void {
+    if (event.Type !== 'container') return
 
-    const monitor = new DockerMonitor(node)
-    monitor.onEvent((event, data) => {
-      if (this.globalCallback) {
-        this.globalCallback(event, data)
+    const action = event.Action
+    // 只关注核心生命周期事件
+    if (!['start', 'die', 'stop', 'restart'].includes(action)) return
+
+    const containerId = event.Actor.ID
+    const containerName = event.Actor.Attributes?.name || 'unknown'
+
+    // 获取容器状态存储
+    const state = this.getContainerState(node.id, containerId)
+    const now = Date.now()
+
+    // ---------------------------------------------------------
+    // 0. 屏蔽 restart 冗余事件
+    // 如果收到 restart，且距离上次 start 只有不到 3秒，说明是连在一起的，忽略 restart
+    // ---------------------------------------------------------
+    if (action === 'restart') {
+      if (state.lastStartTime && (now - state.lastStartTime < 3000)) {
+        monitorLogger.debug(`[${node.name}] ${containerName} 忽略冗余 restart (刚启动)`)
+        return
       }
-    })
+    }
 
-    monitor.start()
-    this.monitors.set(node.id, monitor)
-    monitorLogger.debug(`[${node.name}] 监控已注册`)
-  }
+    // 1. 记录历史用于抖动检测
+    state.history.push(now)
+    this.cleanHistory(state, now)
 
-  /**
-   * 注销节点监控
-   */
-  unregister(nodeId: string): void {
-    const monitor = this.monitors.get(nodeId)
-    if (monitor) {
-      monitor.stop()
-      this.monitors.delete(nodeId)
-      monitorLogger.debug(`节点 ${nodeId} 监控已注销`)
+    // 2. 抖动检测 (Flapping)
+    const threshold = this.config.flappingThreshold || 3
+    if (state.history.length > threshold) {
+      monitorLogger.warn(`[${node.name}] ${containerName} 频繁重启 (Flapping)`)
+
+      // 如果正在防抖等待中，立即清除定时器
+      if (state.stopTimer) {
+        clearTimeout(state.stopTimer)
+        state.stopTimer = undefined
+      }
+
+      // 清空历史，避免重复触发 Flapping 报警
+      state.history = []
+
+      // 发出 Flapping 事件
+      this.emit({
+        eventType: 'container.flapping',
+        action: 'flapping',
+        nodeId: node.id,
+        nodeName: node.name,
+        containerId,
+        containerName,
+        timestamp: now
+      })
+      return
+    }
+
+    // 3. 防抖逻辑
+    const debounceWait = this.config.debounceWait || 60000
+
+    if (action === 'die' || action === 'stop') {
+      // [关键修复] 如果已经有一个定时器在跑了，说明已经处理了 stop/die，
+      // 不要再重复打印日志或重置定时器了。
+      if (state.stopTimer) {
+        monitorLogger.debug(`[${node.name}] ${containerName} 收到 ${action}，但已在等待停止确认中 (忽略)`)
+        return
+      }
+
+      monitorLogger.debug(`[${node.name}] ${containerName} 已停止 (${action})，等待 ${debounceWait}ms...`)
+
+      state.stopTimer = setTimeout(() => {
+        state.stopTimer = undefined
+        // 只有定时器真正走完了，才发送通知
+        this.emit({
+          eventType: `container.die`, // 统一使用 die
+          action: 'die',
+          nodeId: node.id,
+          nodeName: node.name,
+          containerId,
+          containerName,
+          timestamp: Date.now()
+        })
+      }, debounceWait)
+
+    } else if (action === 'start' || action === 'restart') {
+      // [关键] 记录启动时间，用于屏蔽后续的 restart
+      state.lastStartTime = now
+
+      if (state.stopTimer) {
+        // 在防抖时间内恢复：取消报警
+        clearTimeout(state.stopTimer)
+        state.stopTimer = undefined
+        monitorLogger.info(`[${node.name}] ${containerName} 在防抖时间内恢复，通知已抑制`)
+      } else {
+        // 这是一个"干净"的启动（比如手动启动一个已停止很久的容器）
+        this.emit({
+          eventType: `container.${action}`,
+          action: action,
+          nodeId: node.id,
+          nodeName: node.name,
+          containerId,
+          containerName,
+          timestamp: now
+        })
+      }
     }
   }
 
   /**
-   * 设置全局事件回调
+   * 注册处理后事件的回调
    */
-  onEvent(callback: (event: NotificationEventType, data: any) => void): void {
-    this.globalCallback = callback
+  onProcessedEvent(callback: (event: ProcessedEvent) => void): () => void {
+    this.callback = callback
+    return () => { this.callback = undefined }
   }
 
-  /**
-   * 停止所有监控
-   */
-  stopAll(): void {
-    for (const [nodeId, monitor] of this.monitors) {
-      monitor.stop()
+  private emit(event: ProcessedEvent) {
+    if (this.callback) {
+      this.callback(event)
     }
-    this.monitors.clear()
-    monitorLogger.debug('所有监控已停止')
+  }
+
+  private getContainerState(nodeId: string, containerId: string): ContainerState {
+    if (!this.states.has(nodeId)) {
+      this.states.set(nodeId, new Map())
+    }
+    const nodeStates = this.states.get(nodeId)!
+
+    if (!nodeStates.has(containerId)) {
+      nodeStates.set(containerId, {
+        history: []
+      })
+    }
+    return nodeStates.get(containerId)!
+  }
+
+  private cleanHistory(state: ContainerState, now: number) {
+    const window = this.config.flappingWindow || 300000 // 默认 5分钟
+    // 移除超出时间窗口的记录
+    state.history = state.history.filter(t => now - t <= window)
   }
 }

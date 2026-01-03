@@ -157,10 +157,14 @@ export class DockerConnector {
         const stop = () => {
           if (!closed) {
             closed = true
+            // [新增] 强制销毁流，防止僵尸连接
             try {
-              stream.close()
+              stream.unpipe()
+              stream.destroy()
+              // 清理引用
+              ;(this as any)._eventStream = null
             } catch (e) {
-              // 可能已经关闭
+              // 可能已经关闭，忽略错误
             }
             connectorLogger.debug(`[${this.config.name}] 主动停止事件流`)
           }

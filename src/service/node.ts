@@ -1,6 +1,7 @@
 /**
  * Docker 节点类 - 通过 SSH 执行 docker 命令
  */
+import { Random } from 'koishi'
 import type {
   NodeConfig,
   ContainerInfo,
@@ -36,6 +37,10 @@ export class DockerNode {
   private debug = false
   /** 凭证配置 */
   private credential: CredentialConfig
+  /** 用于事件去重: 记录 "ID:Action:Time" -> Timestamp */
+  private eventDedupMap: Map<string, number> = new Map()
+  /** [新增] 实例唯一标识，用于判断是否存在多实例冲突 */
+  private instanceId = Random.id(4)
 
   constructor(config: NodeConfig, credential: CredentialConfig, debug = false) {
     this.config = config
@@ -253,12 +258,34 @@ export class DockerNode {
   private startEventStream(): void {
     if (!this.connector) return
 
+    // 防止并发启动：使用 _startingStream 标志
+    if ((this as any)._startingStream) {
+      nodeLogger.debug(`[${this.name}] 事件流正在启动中，跳过`)
+      return
+    }
+    ;(this as any)._startingStream = true
+
+    // 检查是否已有活跃的流
+    if ((this as any)._activeStreamCount > 0) {
+      nodeLogger.debug(`[${this.name}] 已有 ${(this as any)._activeStreamCount} 个活跃事件流，跳过启动`)
+      ;(this as any)._startingStream = false
+      return
+    }
+
+    ;(this as any)._activeStreamCount = (this as any)._activeStreamCount || 0
+    ;(this as any)._activeStreamCount++
+
+    nodeLogger.debug(`[${this.name}] 启动事件流 (活跃数: ${(this as any)._activeStreamCount})`)
+
     this.connector.startEventStream((line) => {
       this.handleEventLine(line)
     }).then((stop) => {
       ;(this as any)._eventStreamStop = stop
-      nodeLogger.debug(`[${this.name}] 事件流已启动`)
+      ;(this as any)._startingStream = false
+      nodeLogger.debug(`[${this.name}] 事件流回调已注册`)
     }).catch((err) => {
+      ;(this as any)._activeStreamCount--
+      ;(this as any)._startingStream = false
       nodeLogger.warn(`[${this.name}] 事件流启动失败: ${err.message}，5秒后重试`)
       setTimeout(() => this.startEventStream(), 5000)
     })
@@ -276,14 +303,30 @@ export class DockerNode {
       if (type !== 'container') return
       if (!CONTAINER_ACTIONS.includes(action)) return
 
+      const containerId = actor?.ID
       const containerName = actor?.Attributes?.name
-      const image = actor?.Attributes?.image
+
+      // [去重逻辑] 使用 timeNano (纳秒) 确保唯一性
+      const eventTimeNano = timeNano || (time ? time * 1e9 : Date.now() * 1e6)
+      const dedupKey = `${containerId}:${action}:${eventTimeNano}`
+      const lastTime = this.eventDedupMap.get(dedupKey)
+      const now = Date.now()
+
+      // 100ms 内收到完全相同的事件则忽略
+      if (lastTime && (now - lastTime < 100)) {
+        return
+      }
+      this.eventDedupMap.set(dedupKey, now)
+
+      // 清理
+      if (this.eventDedupMap.size > 200) this.eventDedupMap.clear()
 
       // 跳过无法识别名称的容器
       if (!containerName || containerName === 'unknown') return
 
-      // 更新本地缓存状态，避免下次全量同步时误报
-      // 例如收到 die 事件，就将本地缓存更新为 exited
+      const image = actor?.Attributes?.image
+
+      // [关键] 对于 die 和 stop，都标记为 stopped，保持状态同步
       if (actor?.ID) {
         const inferredState = (action === 'start' || action === 'restart') ? 'running' : 'stopped'
         this.lastContainerStates.set(actor.ID, inferredState)
@@ -304,7 +347,7 @@ export class DockerNode {
         timeNano: timeNano || Date.now() * 1e6,
       }
 
-      nodeLogger.debug(`[${this.name}] 事件流: ${containerName} ${action}`)
+      nodeLogger.debug(`[${this.name}#${this.instanceId}] 事件流: ${containerName} ${action}`)
       this.emitEvent(event)
     } catch (e) {
       // 忽略非 JSON 行
@@ -452,6 +495,10 @@ export class DockerNode {
       ;(this as any)._eventStreamStop()
       ;(this as any)._eventStreamStop = null
     }
+    // 重置事件流计数
+    ;(this as any)._activeStreamCount = 0
+    // 重置启动标志
+    ;(this as any)._startingStream = false
     // 停止重试定时器
     if (this.eventTimer) {
       clearTimeout(this.eventTimer)
