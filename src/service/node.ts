@@ -2,6 +2,7 @@
  * Docker 节点类 - 通过 SSH 执行 docker 命令
  */
 import { Random } from 'koishi'
+import Dockerode, { DockerOptions, NetworkInspectInfo, ContainerInspectInfo } from 'dockerode'
 import type {
   NodeConfig,
   ContainerInfo,
@@ -25,6 +26,10 @@ export class DockerNode {
   public status: NodeStatusType = NodeStatus.DISCONNECTED
   /** SSH 连接器 */
   private connector: DockerConnector | null = null
+  /** Dockerode 实例 (用于 API 调用) */
+  private dockerode: Dockerode | null = null
+  /** Docker API 是否可用 */
+  private dockerApiAvailable = false
   /** 监控定时器 (容器状态轮询) */
   private monitorTimer: NodeJS.Timeout | null = null
   /** 事件监控定时器 (docker events) */
@@ -87,8 +92,11 @@ export class DockerNode {
         // 标记连接可用，允许事件流自动重连
         connector.setConnected(true)
 
+        // 初始化 Dockerode (用于 API 调用)
+        this.initDockerode()
+
         this.status = NodeStatus.CONNECTED
-        nodeLogger.info(`[${this.name}] 连接成功`)
+        nodeLogger.info(`[${this.name}] 连接成功 (SSH + ${this.dockerApiAvailable ? 'Docker API' : 'SSH 命令模式'})`)
 
         // 启动监控
         this.startMonitoring()
@@ -128,6 +136,8 @@ export class DockerNode {
 
     this.connector?.dispose()
     this.connector = null
+    this.dockerode = null
+    this.dockerApiAvailable = false
 
     this.status = NodeStatus.DISCONNECTED
     nodeLogger.info(`[${this.name}] 已断开连接`)
@@ -139,50 +149,6 @@ export class DockerNode {
   async reconnect(): Promise<void> {
     await this.disconnect()
     await this.connect()
-  }
-
-  /**
-   * 列出容器
-   */
-  async listContainers(all = true): Promise<ContainerInfo[]> {
-    if (!this.connector || this.status !== NodeStatus.CONNECTED) {
-      throw new Error(`节点 ${this.name} 未连接`)
-    }
-
-    const output = await this.connector.listContainers(all)
-    return this.parseContainerList(output)
-  }
-
-  /**
-   * 启动容器
-   */
-  async startContainer(containerId: string): Promise<void> {
-    if (!this.connector) throw new Error('未连接')
-    await this.connector.startContainer(containerId)
-  }
-
-  /**
-   * 停止容器
-   */
-  async stopContainer(containerId: string, timeout = 10): Promise<void> {
-    if (!this.connector) throw new Error('未连接')
-    await this.connector.stopContainer(containerId, timeout)
-  }
-
-  /**
-   * 重启容器
-   */
-  async restartContainer(containerId: string, timeout = 10): Promise<void> {
-    if (!this.connector) throw new Error('未连接')
-    await this.connector.restartContainer(containerId, timeout)
-  }
-
-  /**
-   * 获取容器日志
-   */
-  async getContainerLogs(containerId: string, tail = 100): Promise<string> {
-    if (!this.connector) throw new Error('未连接')
-    return this.connector.getLogs(containerId, tail)
   }
 
   /**
@@ -358,6 +324,413 @@ export class DockerNode {
     const output = await this.connector.exec(`docker inspect ${containerId}`)
     const info = JSON.parse(output)
     return Array.isArray(info) ? info[0] : info
+  }
+
+  /**
+   * 初始化 Dockerode
+   * 根据配置决定连接本地 Socket 还是通过 SSH 连接远程
+   */
+  private initDockerode(): void {
+    try {
+      let dockerOptions: DockerOptions
+
+      // 判断是否是本地节点
+      const isLocal = this.config.host === '127.0.0.1' || this.config.host === 'localhost'
+
+      if (isLocal) {
+        // 本地连接
+        dockerOptions = {
+          socketPath: '/var/run/docker.sock',
+        }
+      } else {
+        // === 远程 SSH 连接配置 ===
+
+        // 1. 构建 ssh2 的连接参数
+        const sshOpts: any = {
+          host: this.config.host,
+          port: this.config.port || 22,
+          username: this.credential.username,
+          readyTimeout: 20000, // 连接超时
+        }
+
+        // 2. 根据认证类型注入凭证
+        if (this.credential.authType === 'password' && this.credential.password) {
+          sshOpts.password = this.credential.password
+        } else if (this.credential.privateKey) {
+          // 关键：私钥通常需要去掉首尾多余空白，否则 ssh2 解析会失败
+          sshOpts.privateKey = this.credential.privateKey.trim()
+          if (this.credential.passphrase) {
+            sshOpts.passphrase = this.credential.passphrase
+          }
+        }
+
+        // 3. 构建 Dockerode 配置
+        // 重点：必须使用 sshOptions 属性包裹 ssh 配置，否则 dockerode 可能无法正确透传凭证
+        dockerOptions = {
+          protocol: 'ssh',
+          host: this.config.host,
+          port: this.config.port || 22,
+          username: this.credential.username,
+          sshOptions: sshOpts, // <--- 这里是修复的关键
+        } as any
+      }
+
+      this.dockerode = new Dockerode(dockerOptions)
+
+      // 测试连接是否真正可用
+      this.dockerode.ping().then(() => {
+        this.dockerApiAvailable = true
+        nodeLogger.debug(`[${this.name}] Docker API 连接成功 (${isLocal ? 'Local' : 'SSH'})`)
+      }).catch((e: any) => {
+        this.dockerApiAvailable = false
+        // 详细记录错误原因，方便排查
+        nodeLogger.warn(`[${this.name}] Docker API 连接失败: ${e.message} (将降级使用 SSH 命令)`)
+      })
+    } catch (e) {
+      this.dockerode = null
+      this.dockerApiAvailable = false
+      nodeLogger.debug(`[${this.name}] Dockerode 初始化异常: ${e}`)
+    }
+  }
+
+  /**
+   * 列出容器 (优先使用 API)
+   */
+  async listContainers(all = true): Promise<ContainerInfo[]> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        const containers = await this.dockerode.listContainers({ all })
+
+        // 转换 Dockerode 的返回格式
+        return containers.map(c => ({
+          Id: c.Id,
+          Names: c.Names,
+          Image: c.Image,
+          ImageID: c.ImageID,
+          Command: c.Command,
+          Created: c.Created,
+          Ports: c.Ports,
+          Labels: c.Labels,
+          State: c.State as any,
+          Status: c.Status,
+          HostConfig: { NetworkMode: (c.HostConfig as any)?.NetworkMode || '' },
+          NetworkSettings: { Networks: (c.NetworkSettings as any)?.Networks || {} },
+        }))
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API listContainers 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    if (!this.connector || this.status !== NodeStatus.CONNECTED) {
+      throw new Error(`节点 ${this.name} 未连接`)
+    }
+    const output = await this.connector.listContainers(all)
+    return this.parseContainerList(output)
+  }
+
+  /**
+   * 启动容器
+   */
+  async startContainer(containerId: string): Promise<void> {
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        const container = this.dockerode.getContainer(containerId)
+        await container.start()
+        return
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API startContainer 失败: ${e.message}`)
+      }
+    }
+    // Fallback
+    if (!this.connector) throw new Error('未连接')
+    await this.connector.startContainer(containerId)
+  }
+
+  /**
+   * 停止容器
+   */
+  async stopContainer(containerId: string, timeout = 10): Promise<void> {
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        const container = this.dockerode.getContainer(containerId)
+        await container.stop({ t: timeout })
+        return
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API stopContainer 失败: ${e.message}`)
+      }
+    }
+    // Fallback
+    if (!this.connector) throw new Error('未连接')
+    await this.connector.stopContainer(containerId, timeout)
+  }
+
+  /**
+   * 重启容器
+   */
+  async restartContainer(containerId: string, timeout = 10): Promise<void> {
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        const container = this.dockerode.getContainer(containerId)
+        await container.restart({ t: timeout })
+        return
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API restartContainer 失败: ${e.message}`)
+      }
+    }
+    // Fallback
+    if (!this.connector) throw new Error('未连接')
+    await this.connector.restartContainer(containerId, timeout)
+  }
+
+  /**
+   * 获取容器日志 (优先使用 API)
+   */
+  async getContainerLogs(containerId: string, tail = 100): Promise<string> {
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        const container = this.dockerode.getContainer(containerId)
+        const buffer = await container.logs({
+          follow: false,
+          stdout: true,
+          stderr: true,
+          tail: tail,
+          timestamps: false,
+        }) as Buffer
+
+        return this.cleanDockerLogStream(buffer)
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API getLogs 失败: ${e.message}`)
+      }
+    }
+
+    // Fallback
+    if (!this.connector) throw new Error('未连接')
+    return this.connector.getLogs(containerId, tail)
+  }
+
+  /**
+   * 清洗 Docker 日志流 (去除 8 字节头部)
+   */
+  private cleanDockerLogStream(buffer: Buffer): string {
+    let offset = 0
+    let output = ''
+
+    while (offset < buffer.length) {
+      // 头部结构: [STREAM_TYPE, 0, 0, 0, SIZE1, SIZE2, SIZE3, SIZE4]
+      if (offset + 8 > buffer.length) break
+
+      // 读取 payload 大小 (大端序)
+      const size = buffer.readUInt32BE(offset + 4)
+
+      // 移动到 payload 开始
+      offset += 8
+
+      if (offset + size > buffer.length) break
+
+      // 读取实际内容
+      output += buffer.subarray(offset, offset + size).toString('utf-8')
+      offset += size
+    }
+
+    // 如果解析失败，直接转 string
+    if (!output && buffer.length > 0) return buffer.toString('utf-8')
+    return output
+  }
+
+  /**
+   * 使用 Docker API 获取容器性能数据
+   */
+  private async getContainerStatsByApi(containerId: string): Promise<{
+    cpuPercent: string
+    memoryUsage: string
+    memoryLimit: string
+    memoryPercent: string
+    networkIn: string
+    networkOut: string
+    blockIn: string
+    blockOut: string
+    pids: string
+  } | null> {
+    if (!this.dockerode || !this.dockerApiAvailable) {
+      return null
+    }
+
+    try {
+      const container = this.dockerode.getContainer(containerId)
+      // stream: false 时，dockerode 直接返回解析好的 Object，而不是 Buffer 或 Stream
+      const data = await container.stats({ stream: false }) as any
+
+      // 内存使用量 (bytes)
+      const memoryUsage = data.memory_stats?.usage || 0
+      const memoryLimit = data.memory_stats?.limit || 0
+      const memoryPercent = memoryLimit > 0 ? ((memoryUsage / memoryLimit) * 100).toFixed(2) + '%' : '0%'
+
+      // CPU 使用率计算 (基于 cpu_delta / system_cpu_delta)
+      const cpuUsage = data.cpu_stats?.cpu_usage?.total_usage || 0
+      const systemUsage = data.cpu_stats?.system_cpu_usage || 0
+
+      // 有些环境 online_cpus 不存在，回退到 percpu_usage 的长度
+      const cpuCount = data.cpu_stats?.online_cpus || data.cpu_stats?.cpu_usage?.percpu_usage?.length || 1
+
+      let cpuPercent = '0.00%'
+
+      // 需要前一次的数据 (precpu_stats) 来计算差值
+      if (data.precpu_stats?.cpu_usage?.total_usage !== undefined && data.precpu_stats?.system_cpu_usage !== undefined) {
+        const cpuDelta = cpuUsage - data.precpu_stats.cpu_usage.total_usage
+        const systemDelta = systemUsage - data.precpu_stats.system_cpu_usage
+
+        if (systemDelta > 0 && cpuDelta > 0) {
+          // 公式: (cpuDelta / systemDelta) * cpuCount * 100
+          cpuPercent = ((cpuDelta / systemDelta) * cpuCount * 100).toFixed(2) + '%'
+        }
+      }
+
+      // 网络流量 (bytes)
+      const networks = data.networks || {}
+      let networkIn = 0
+      let networkOut = 0
+      // 累加所有网卡的流量
+      for (const net of Object.values(networks as Record<string, { rx_bytes: number; tx_bytes: number }>)) {
+        networkIn += net.rx_bytes || 0
+        networkOut += net.tx_bytes || 0
+      }
+
+      // Block IO (bytes)
+      const blkioStats = data.blkio_stats || {}
+      const ioServiceBytes = blkioStats.io_service_bytes_recursive || []
+      let blockIn = 0
+      let blockOut = 0
+      for (const io of ioServiceBytes) {
+        if (io.op === 'Read') blockIn += io.value || 0
+        if (io.op === 'Write') blockOut += io.value || 0
+      }
+
+      // 进程数
+      const pids = data.pids_stats?.current || '-'
+
+      return {
+        cpuPercent,
+        memoryUsage: formatBytes(memoryUsage),
+        memoryLimit: formatBytes(memoryLimit),
+        memoryPercent,
+        networkIn: formatBytes(networkIn),
+        networkOut: formatBytes(networkOut),
+        blockIn: formatBytes(blockIn),
+        blockOut: formatBytes(blockOut),
+        pids: String(pids),
+      }
+    } catch (e) {
+      // 只有在调试模式下打印详细错误，防止刷屏
+      if (this.debug) {
+        nodeLogger.warn(`[${this.name}] Docker API 获取性能数据失败: ${e}`)
+      }
+      return null
+    }
+  }
+
+  /**
+   * 获取容器性能数据 (CPU、内存使用率)
+   * 优先使用 Docker API，失败则降级到 SSH 命令
+   */
+  async getContainerStats(containerId: string): Promise<{
+    cpuPercent: string
+    memoryUsage: string
+    memoryLimit: string
+    memoryPercent: string
+    networkIn: string
+    networkOut: string
+    blockIn: string
+    blockOut: string
+    pids: string
+  } | null> {
+    if (!this.connector) return null
+
+    // 优先尝试 Docker API
+    if (this.dockerApiAvailable) {
+      const apiResult = await this.getContainerStatsByApi(containerId)
+      if (apiResult) {
+        nodeLogger.debug(`[${this.name}] Docker API 获取容器 ${containerId} 性能数据成功`)
+        return apiResult
+      }
+      nodeLogger.debug(`[${this.name}] Docker API 获取容器 ${containerId} 性能数据失败，降级到 SSH`)
+    }
+
+    // 降级到 SSH 命令
+    try {
+      // 使用 execWithExitCode，因为停止的容器返回退出码 1
+      const result = await this.connector.execWithExitCode(
+        `docker stats --no-stream --no-trunc ${containerId} --format "{{.CPUPerc}}|{{.MemPerc}}|{{.MemUsage}}|{{.NetIn}}|{{.NetOut}}|{{.BlockIn}}|{{.BlockOut}}|{{.PIDs}}"`
+      )
+
+      nodeLogger.debug(`[${this.name}] SSH docker stats 输出: "${result.output}", 退出码: ${result.exitCode}`)
+
+      // 如果没有输出（容器可能不存在或已停止），返回 null
+      if (!result.output.trim()) {
+        nodeLogger.debug(`[${this.name}] 容器 ${containerId} 性能数据为空，可能已停止`)
+        return null
+      }
+
+      const parts = result.output.split('|')
+      if (parts.length < 8) {
+        nodeLogger.warn(`[${this.name}] 容器 ${containerId} 性能数据格式异常: "${result.output}"`)
+        return null
+      }
+
+      // MemUsage 格式: "123.4MiB / 2GiB"，解析内存使用量和限制
+      const memUsageParts = parts[2]?.split(' / ') || ['-', '-']
+
+      return {
+        cpuPercent: parts[0]?.trim() || '-',
+        memoryPercent: parts[1]?.trim() || '-',
+        memoryUsage: memUsageParts[0]?.trim() || '-',
+        memoryLimit: memUsageParts[1]?.trim() || '-',
+        networkIn: parts[3]?.trim() || '-',
+        networkOut: parts[4]?.trim() || '-',
+        blockIn: parts[5]?.trim() || '-',
+        blockOut: parts[6]?.trim() || '-',
+        pids: parts[7]?.trim() || '-',
+      }
+    } catch (e) {
+      nodeLogger.warn(`[${this.name}] 获取容器 ${containerId} 性能数据失败: ${e}`)
+      return null
+    }
+  }
+
+  /**
+   * 获取容器端口映射
+   */
+  async getContainerPorts(containerId: string): Promise<string[]> {
+    if (!this.connector) return []
+
+    try {
+      const output = await this.connector.exec(
+        `docker inspect ${containerId} --format "{{json .HostConfig.PortBindings}}"`
+      )
+
+      if (!output.trim() || output === 'null') {
+        return []
+      }
+
+      const portBindings = JSON.parse(output) as Record<string, Array<{ HostIp: string; HostPort: string }>>
+      const portStrings: string[] = []
+
+      for (const [containerPort, bindings] of Object.entries(portBindings)) {
+        for (const binding of bindings) {
+          if (binding.HostIp === '0.0.0.0' || binding.HostIp === '::') {
+            portStrings.push(`${binding.HostPort}->${containerPort}`)
+          } else {
+            portStrings.push(`${binding.HostIp}:${binding.HostPort}->${containerPort}`)
+          }
+        }
+      }
+
+      return portStrings.sort()
+    } catch (e) {
+      nodeLogger.warn(`[${this.name}] 获取容器 ${containerId} 端口映射失败: ${e}`)
+      return []
+    }
   }
 
   /**
@@ -729,4 +1102,15 @@ export class DockerNode {
   get name(): string { return this.config.name }
   get id(): string { return this.config.id }
   get tags(): string[] { return this.config.tags }
+}
+
+/**
+ * 格式化字节为可读格式
+ */
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes < 0) return '-'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }

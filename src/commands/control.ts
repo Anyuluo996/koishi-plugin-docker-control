@@ -7,6 +7,17 @@ import { commandLogger } from '../utils/logger'
 import { generateResultHtml, generateInspectHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
+ * 格式化网络流量显示
+ */
+function formatNet(bytes: string): string {
+  const num = parseFloat(bytes)
+  if (isNaN(num)) return '-'
+  if (num < 1024) return bytes + 'B'
+  if (num < 1024 * 1024) return (num / 1024).toFixed(1) + 'KB'
+  return (num / 1024 / 1024).toFixed(2) + 'MB'
+}
+
+/**
  * 格式化容器搜索结果
  */
 function formatSearchResults(
@@ -239,9 +250,14 @@ export function registerControlCommands(
         )
 
         const info = await node.getContainer(found.Id)
+        // 获取性能数据和端口映射
+        const [stats, ports] = await Promise.all([
+          node.getContainerStats(found.Id),
+          node.getContainerPorts(found.Id),
+        ])
 
         if (useImageOutput && ctx.puppeteer) {
-          const html = generateInspectHtml(node.name, info)
+          const html = generateInspectHtml(node.name, info, stats, ports)
           return await renderToImage(ctx, html)
         }
 
@@ -254,6 +270,25 @@ export function registerControlCommands(
           `启动时间: ${info.State.StartedAt}`,
           `重启次数: ${info.RestartCount || 0}`,
         ]
+
+        // 添加性能数据
+        if (stats) {
+          lines.push('')
+          lines.push('性能监控:')
+          lines.push(`  CPU: ${stats.cpuPercent}`)
+          lines.push(`  内存: ${stats.memoryPercent} (${stats.memoryUsage} / ${stats.memoryLimit})`)
+          lines.push(`  网络: ${formatNet(stats.networkIn)} / ${formatNet(stats.networkOut)}`)
+          lines.push(`  进程: ${stats.pids}`)
+        }
+
+        // 添加端口映射
+        if (ports && ports.length > 0) {
+          lines.push('')
+          lines.push('端口映射:')
+          for (const port of ports) {
+            lines.push(`  ${port}`)
+          }
+        }
 
         if (info.State.Health) {
           lines.push(`健康状态: ${info.State.Health.Status}`)

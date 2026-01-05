@@ -327,7 +327,19 @@ export function generateResultHtml(
  */
 export function generateInspectHtml(
   nodeName: string,
-  info: any
+  info: any,
+  stats?: {
+    cpuPercent: string
+    memoryUsage: string
+    memoryLimit: string
+    memoryPercent: string
+    networkIn: string
+    networkOut: string
+    blockIn: string
+    blockOut: string
+    pids: string
+  } | null,
+  ports?: string[]
 ): string {
   const name = info.Name.replace('/', '')
   const shortId = info.Id.slice(0, 12)
@@ -368,6 +380,70 @@ export function generateInspectHtml(
       }).join('\n')
     : '-'
 
+  // 端口映射
+  const portsDisplay = ports && ports.length > 0
+    ? ports.join('\n')
+    : '-'
+
+  // 判断容器是否运行
+  const containerRunning = info.State.Running
+
+  // 性能数据
+  const statsDisplay = stats
+    ? containerRunning
+      ? `
+        <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px;">
+          <div style="background: rgba(0,0,0,0.15); padding: 6px 4px; border-radius: 6px; text-align: center;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">CPU</div>
+            <div style="font-size: 13px; font-weight: 600; color: ${parseCpuColor(stats.cpuPercent)}">${stats.cpuPercent}</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.15); padding: 6px 4px; border-radius: 6px; text-align: center;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">内存</div>
+            <div style="font-size: 13px; font-weight: 600; color: #60a5fa">${stats.memoryUsage}</div>
+            <div style="font-size: 9px; color: #cbd5e1;">/ ${stats.memoryLimit}</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.15); padding: 6px 4px; border-radius: 6px; text-align: center;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">网络</div>
+            <div style="font-size: 13px; font-weight: 600; color: #60a5fa">${stats.networkIn ? formatNetwork(stats.networkIn) : '-'}</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.15); padding: 6px 4px; border-radius: 6px; text-align: center;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">IO</div>
+            <div style="font-size: 13px; font-weight: 600; color: #f472b6">${stats.blockIn}</div>
+            <div style="font-size: 9px; color: #cbd5e1;">↓ ${stats.blockOut}↑</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.15); padding: 6px 4px; border-radius: 6px; text-align: center;">
+            <div style="font-size: 9px; color: #94a3b8; margin-bottom: 2px;">进程</div>
+            <div style="font-size: 13px; font-weight: 600; color: #a78bfa">${stats.pids}</div>
+          </div>
+        </div>
+      `
+      : `
+        <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px;">
+          <div style="background: rgba(0,0,0,0.1); padding: 6px 4px; border-radius: 6px; text-align: center; opacity: 0.6;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">CPU</div>
+            <div style="font-size: 13px; font-weight: 600; color: #94a3b8;">-</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.1); padding: 6px 4px; border-radius: 6px; text-align: center; opacity: 0.6;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">内存</div>
+            <div style="font-size: 13px; font-weight: 600; color: #94a3b8;">-</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.1); padding: 6px 4px; border-radius: 6px; text-align: center; opacity: 0.6;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">网络</div>
+            <div style="font-size: 13px; font-weight: 600; color: #94a3b8;">-</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.1); padding: 6px 4px; border-radius: 6px; text-align: center; opacity: 0.6;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">IO</div>
+            <div style="font-size: 13px; font-weight: 600; color: #94a3b8;">-</div>
+          </div>
+          <div style="background: rgba(0,0,0,0.1); padding: 6px 4px; border-radius: 6px; text-align: center; opacity: 0.6;">
+            <div style="font-size: 9px; color: #cbd5e1; margin-bottom: 2px;">进程</div>
+            <div style="font-size: 13px; font-weight: 600; color: #a78bfa">${stats.pids}</div>
+          </div>
+        </div>
+        <div style="font-size: 9px; color: #f59e0b; margin-top: 6px;">⚠ 容器已停止，无法获取实时监控数据</div>
+      `
+    : '<span style="color: #64748b; font-size: 11px;">(获取失败)</span>'
+
   const items = [
     { label: '容器名称', value: name, span: false },
     { label: '容器 ID', value: info.Id, span: false },
@@ -377,6 +453,8 @@ export function generateInspectHtml(
     { label: '启动时间', value: new Date(info.State.StartedAt).toLocaleString(), span: false },
     { label: '重启策略', value: restartDisplay, span: false },
     { label: '重启次数', value: String(info.RestartCount), span: false },
+    { label: '性能监控', value: statsDisplay, span: true, isHtml: true },
+    { label: '端口映射', value: portsDisplay, span: true },
     { label: '网络', value: networkInfo, span: true },
     { label: '环境变量', value: envDisplay, span: true },
     { label: '挂载目录', value: mountsDisplay, span: true },
@@ -389,7 +467,7 @@ export function generateInspectHtml(
   const gridItems = items.map(item => `
     <div class="detail-item ${item.span ? 'detail-span' : ''}">
       <div class="detail-label">${item.label}</div>
-      <div class="detail-value ${item.highlight ? 'highlight' : ''}">${item.value.replace(/\n/g, '<br>')}</div>
+      <div class="detail-value ${item.highlight ? 'highlight' : ''}">${item.isHtml ? item.value : item.value.replace(/\n/g, '<br>')}</div>
     </div>
   `).join('')
 
@@ -418,6 +496,41 @@ export function generateInspectHtml(
   `
 
   return wrapHtml(header + body)
+}
+
+/**
+ * 根据 CPU 使用率返回颜色
+ */
+function parseCpuColor(cpuPercent: string): string {
+  const value = parseFloat(cpuPercent.replace('%', ''))
+  if (isNaN(value)) return '#94a3b8'
+  if (value < 30) return '#4ade80'
+  if (value < 60) return '#facc15'
+  if (value < 80) return '#fb923c'
+  return '#f87171'
+}
+
+/**
+ * 根据内存使用率返回颜色
+ */
+function parseMemColor(memPercent: string): string {
+  const value = parseFloat(memPercent.replace('%', ''))
+  if (isNaN(value)) return '#94a3b8'
+  if (value < 50) return '#60a5fa'
+  if (value < 70) return '#facc15'
+  if (value < 85) return '#fb923c'
+  return '#f87171'
+}
+
+/**
+ * 格式化网络流量显示
+ */
+function formatNetwork(bytes: string): string {
+  const num = parseFloat(bytes)
+  if (isNaN(num)) return '-'
+  if (num < 1024) return bytes + 'B/s'
+  if (num < 1024 * 1024) return (num / 1024).toFixed(1) + 'KB/s'
+  return (num / 1024 / 1024).toFixed(2) + 'MB/s'
 }
 
 /**
