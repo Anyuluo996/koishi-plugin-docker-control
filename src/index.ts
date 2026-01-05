@@ -12,7 +12,7 @@ export const name = 'docker-control'
 
 export const inject = {
   required: ['database'],
-  optional: ['puppeteer'],
+  optional: ['puppeteer', 'assets'],
 }
 
 // 订阅记录类型定义
@@ -32,6 +32,9 @@ declare module 'koishi' {
   interface Context {
     puppeteer?: {
       render: (html: string, callback?: (page: any, next: (handle?: any) => Promise<string>) => Promise<string>) => Promise<string>
+    }
+    assets?: {
+      upload: (data: string | Buffer, filename: string) => Promise<string>
     }
   }
 

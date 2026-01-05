@@ -134,3 +134,31 @@ export interface SubscriptionConfig {
   /** 创建时间 */
   createdAt?: number
 }
+
+// ==================== Compose 类型 ====================
+
+export interface ComposeFileInfo {
+  /** 原始路径 (Windows 路径或 WSL 路径) */
+  originalPath: string
+  /** 实际使用的路径 (尝试转换后的路径) */
+  effectivePath: string
+  /** 是否使用了 WSL 路径转换 */
+  usedWslPath: boolean
+  /** Compose 文件内容 */
+  content: string
+  /** 所属项目名称 */
+  projectName: string
+  /** 容器数量 */
+  serviceCount: number
+}
+
+export interface ContainerComposeInfo {
+  /** 容器 ID */
+  containerId: string
+  /** 容器名称 */
+  containerName: string
+  /** 所属 Docker Compose 项目 */
+  projectName: string
+  /** Compose 文件路径 */
+  composeFilePath: string
+}

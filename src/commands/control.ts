@@ -4,7 +4,7 @@
  */
 import { Command, Context } from 'koishi'
 import { commandLogger } from '../utils/logger'
-import { generateResultHtml, generateInspectHtml, renderToImage } from '../utils/render'
+import { generateResultHtml, generateInspectHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
  * 格式化容器搜索结果
@@ -290,13 +290,15 @@ export function registerControlCommands(
           container
         )
 
-        const result = await node.execContainer(found.Id, [
-          '/bin/sh',
-          '-c',
-          cmd,
-        ])
+        const result = await node.execContainer(found.Id, cmd)
 
         const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
+
+        // 图片渲染模式
+        if (useImageOutput && ctx.puppeteer) {
+          const html = generateExecHtml(node.name, name, cmd, result.output, result.exitCode)
+          return await renderToImage(ctx, html)
+        }
 
         if (result.output.trim()) {
           return `=== ${node.name}: ${name} ===\n${result.output}`

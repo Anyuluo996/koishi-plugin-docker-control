@@ -8,6 +8,8 @@ import type {
   DockerEvent,
   NodeStatusType,
   CredentialConfig,
+  ComposeFileInfo,
+  ContainerComposeInfo,
 } from '../types'
 import { NodeStatus, RETRY_INTERVAL, MAX_RETRY_COUNT, EVENTS_POLL_INTERVAL, CONTAINER_POLL_INTERVAL } from '../constants'
 import { DockerConnector } from './connector'
@@ -50,6 +52,7 @@ export class DockerNode {
 
   /**
    * 连接到 Docker (带重试)
+   * 前 3 次失败后每 1 分钟重试一次，直到成功
    */
   async connect(): Promise<void> {
     if (this.status === NodeStatus.CONNECTING) {
@@ -59,11 +62,19 @@ export class DockerNode {
 
     this.status = NodeStatus.CONNECTING
     let attempt = 0
-    let lastError: Error | null = null
+    const MAX_INITIAL_ATTEMPTS = 3  // 前 3 次快速重试
+    const LONG_RETRY_INTERVAL = 60000  // 1 分钟
 
-    while (attempt < MAX_RETRY_COUNT) {
+    while (true) {
       attempt++
-      nodeLogger.info(`[${this.name}] 连接尝试 ${attempt}/${MAX_RETRY_COUNT}...`)
+      const isInitialAttempts = attempt <= MAX_INITIAL_ATTEMPTS
+      const currentInterval = isInitialAttempts ? RETRY_INTERVAL : LONG_RETRY_INTERVAL
+
+      if (isInitialAttempts) {
+        nodeLogger.info(`[${this.name}] 连接尝试 ${attempt}/${MAX_INITIAL_ATTEMPTS}...`)
+      } else {
+        nodeLogger.info(`[${this.name}] 连接尝试 ${attempt} (每 ${LONG_RETRY_INTERVAL / 1000} 秒重试)...`)
+      }
 
       try {
         // 创建 connector
@@ -94,23 +105,18 @@ export class DockerNode {
 
         return
       } catch (error: unknown) {
-        lastError = error instanceof Error ? error : new Error(String(error))
+        const lastError = error instanceof Error ? error : new Error(String(error))
         nodeLogger.warn(`[${this.name}] 连接失败: ${lastError.message}`)
 
         // 清理连接
         this.connector?.dispose()
         this.connector = null
 
-        // 如果还有重试次数，等待后重试
-        if (attempt < MAX_RETRY_COUNT) {
-          await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL))
-        }
+        // 等待后重试
+        nodeLogger.info(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
+        await new Promise(resolve => setTimeout(resolve, currentInterval))
       }
     }
-
-    // 所有重试都失败
-    this.status = NodeStatus.ERROR
-    nodeLogger.error(`[${this.name}] 连接失败，已重试 ${MAX_RETRY_COUNT} 次`)
   }
 
   /**
@@ -182,7 +188,7 @@ export class DockerNode {
   /**
    * 执行容器内命令
    */
-  async execContainer(containerId: string, cmd: string): Promise<string> {
+  async execContainer(containerId: string, cmd: string): Promise<{ output: string; exitCode: number }> {
     if (!this.connector) throw new Error('未连接')
     return this.connector.execContainer(containerId, cmd)
   }
@@ -201,6 +207,147 @@ export class DockerNode {
       Arch: info.Arch || 'unknown',
       KernelVersion: info.KernelVersion || 'unknown',
     }
+  }
+
+  /**
+   * 获取系统信息 (CPU、内存)
+   */
+  async getSystemInfo(): Promise<{ NCPU: number; MemTotal: number; MemAvailable?: number } | null> {
+    if (!this.connector) return null
+    try {
+      // 使用 execWithExitCode 避免非零退出码抛出异常
+      const result = await this.connector.execWithExitCode('docker info --format "{{.NCPU}} {{.MemTotal}} {{.MemAvailable}}"')
+      nodeLogger.debug(`[${this.name}] docker info 输出: "${result.output}", 退出码: ${result.exitCode}`)
+      // docker info 可能返回退出码 1 但仍有输出（权限问题），只要有输出就解析
+      if (!result.output.trim()) {
+        nodeLogger.warn(`[${this.name}] docker info 输出为空`)
+        return null
+      }
+      const parts = result.output.trim().split(/\s+/)
+      if (parts.length >= 2) {
+        return {
+          NCPU: parseInt(parts[0]) || 0,
+          MemTotal: parseInt(parts[1]) || 0,
+          MemAvailable: parts[2] ? parseInt(parts[2]) : undefined,
+        }
+      }
+      return null
+    } catch (e) {
+      nodeLogger.warn(`[${this.name}] 获取系统信息异常: ${e}`)
+      return null
+    }
+  }
+
+  /**
+   * 获取容器数量
+   */
+  async getContainerCount(): Promise<{ running: number; total: number }> {
+    if (!this.connector) throw new Error('未连接')
+    try {
+      const running = await this.connector.exec('docker ps -q | wc -l')
+      const total = await this.connector.exec('docker ps -aq | wc -l')
+      return {
+        running: parseInt(running.trim()) || 0,
+        total: parseInt(total.trim()) || 0,
+      }
+    } catch {
+      return { running: 0, total: 0 }
+    }
+  }
+
+  /**
+   * 获取镜像数量
+   */
+  async getImageCount(): Promise<number> {
+    if (!this.connector) throw new Error('未连接')
+    try {
+      const output = await this.connector.exec('docker images -q | wc -l')
+      return parseInt(output.trim()) || 0
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 获取容器的 Docker Compose 信息
+   * 通过标签 com.docker.compose.project.config_files 获取 compose 文件路径
+   */
+  async getContainerComposeInfo(containerId: string): Promise<ContainerComposeInfo | null> {
+    if (!this.connector) throw new Error('未连接')
+
+    try {
+      // 使用 docker inspect 获取容器标签
+      const output = await this.connector.exec(`docker inspect ${containerId} --format "{{json .Config.Labels}}"`)
+      if (!output.trim()) {
+        return null
+      }
+
+      const labels = JSON.parse(output) as Record<string, string>
+
+      // 获取 compose 项目名称和配置文件路径
+      const projectName = labels['com.docker.compose.project'] || ''
+      const configFiles = labels['com.docker.compose.project.config_files'] || ''
+
+      if (!projectName || !configFiles) {
+        return null
+      }
+
+      return {
+        containerId,
+        containerName: labels['com.docker.compose.container-number'] || '',
+        projectName,
+        composeFilePath: configFiles,
+      }
+    } catch (e) {
+      nodeLogger.warn(`[${this.name}] 获取容器 ${containerId} 的 compose 信息失败: ${e}`)
+      return null
+    }
+  }
+
+  /**
+   * 获取容器的 Docker Compose 文件信息
+   * 读取并解析 compose 文件
+   */
+  async getComposeFileInfo(containerId: string): Promise<ComposeFileInfo | null> {
+    if (!this.connector) throw new Error('未连接')
+
+    try {
+      const composeInfo = await this.getContainerComposeInfo(containerId)
+      if (!composeInfo) {
+        return null
+      }
+
+      const filePath = composeInfo.composeFilePath
+      const originalPath = filePath
+
+      // 尝试读取文件 (支持 Windows 路径自动转换)
+      const content = await this.connector.readFile(filePath)
+
+      // 统计服务数量 (简单的 yaml 解析)
+      const serviceCount = this.countServices(content)
+
+      return {
+        originalPath,
+        effectivePath: filePath,
+        usedWslPath: false, // 实际是否使用了 WSL 路径在内部处理
+        content,
+        projectName: composeInfo.projectName,
+        serviceCount,
+      }
+    } catch (e: any) {
+      nodeLogger.warn(`[${this.name}] 获取 compose 文件信息失败: ${e.message}`)
+      return null
+    }
+  }
+
+  /**
+   * 统计 compose 文件中的服务数量
+   */
+  private countServices(content: string): number {
+    // 简单的正则匹配 services: 下面的服务名
+    const servicePattern = /^[a-zA-Z0-9_-]+:\s*$/gm
+    const matches = content.match(servicePattern)
+    return matches ? matches.length : 0
   }
 
   /**

@@ -6,7 +6,8 @@ import type { DockerControlConfig } from '../types'
 import { registerListCommand } from './list'
 import { registerControlCommands } from './control'
 import { registerLogsCommand } from './logs'
-import { generateNodesHtml, generateNodeDetailHtml, renderToImage } from '../utils/render'
+import { registerComposeCommand } from './compose'
+import { generateNodesHtml, generateNodeDetailHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
  * 获取服务的回调类型
@@ -25,6 +26,7 @@ export function registerCommands(
   registerListCommand(ctx, getService, config)
   registerControlCommands(ctx, getService, config)
   registerLogsCommand(ctx, getService, config)
+  registerComposeCommand(ctx, getService, config)
 
   // 注册辅助指令
   registerHelperCommands(ctx, getService, config)
@@ -95,18 +97,41 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       const node = nodes[0]
 
       try {
-        const version = await node.getVersion()
+        const [version, systemInfo, containerCount, imageCount] = await Promise.all([
+          node.getVersion(),
+          node.getSystemInfo(),
+          node.getContainerCount(),
+          node.getImageCount(),
+        ])
+
+        // 将容器和镜像数量添加到节点对象
+        const nodeData = {
+          ...node,
+          containerCount: containerCount.total,
+          imageCount: imageCount,
+        }
 
         if (useImageOutput && ctx.puppeteer) {
-          const html = generateNodeDetailHtml(node, version)
+          const html = generateNodeDetailHtml(nodeData, version, systemInfo)
           return await renderToImage(ctx, html)
         }
 
+        const memoryUsed = systemInfo?.MemTotal && systemInfo?.MemAvailable !== undefined
+          ? `${Math.round((1 - systemInfo.MemAvailable / systemInfo.MemTotal) * 100)}%`
+          : '-'
+
+        const nodeName = node.config?.name || node.name || node.Name || 'Unknown'
+        const nodeId = node.id || node.ID || node.Id || node.config?.id || '-'
+
         const lines = [
-          `=== ${node.name} ===`,
-          `ID: ${node.id}`,
-          `状态: ${node.status}`,
-          `标签: ${node.tags.join(', ') || '无'}`,
+          `=== ${nodeName} ===`,
+          `ID: ${nodeId}`,
+          `状态: ${node.status || node.Status || 'unknown'}`,
+          `标签: ${node.tags?.join(', ') || node.config?.tags?.join(', ') || '无'}`,
+          `CPU: ${systemInfo?.NCPU || '-'} 核心`,
+          `内存: ${memoryUsed} (可用: ${systemInfo?.MemAvailable ? Math.round(systemInfo.MemAvailable / 1024 / 1024) + ' MB' : '-'})`,
+          `容器: ${containerCount.running}/${containerCount.total} 运行中`,
+          `镜像: ${imageCount} 个`,
           `Docker 版本: ${version.Version}`,
           `API 版本: ${version.ApiVersion}`,
           `操作系统: ${version.Os} (${version.Arch})`,
@@ -188,62 +213,13 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
           return `容器 ${container} 未运行`
         }
 
-        const result = await node.execContainer(c.Id, cmd.split(' '))
+        const result = await node.execContainer(c.Id, cmd)
 
         return [
           `=== 执行结果 ===`,
           `退出码: ${result.exitCode}`,
           '',
           result.output || '(无输出)',
-        ].join('\n')
-      } catch (e: any) {
-        return `执行失败: ${e.message}`
-      }
-    })
-
-  /**
-   * 交互式执行 (返回结果，不支持实时交互)
-   */
-  ctx
-    .command('docker.shell <container> <cmd>', '在容器中执行命令(交互式)')
-    .alias('dockershell', '容器shell')
-    .option('node', '-n <node> 指定节点', { fallback: '' })
-    .option('timeout', '-t <seconds> 超时时间', { fallback: 30 })
-    .action(async ({ options }, container, cmd) => {
-      const service = getService()
-      if (!service) {
-        return 'Docker 服务未初始化'
-      }
-
-      const nodeSelector = options.node || 'all'
-
-      try {
-        const nodes = service.getNodesBySelector(nodeSelector)
-        if (nodes.length === 0) {
-          return `未找到节点: ${nodeSelector}`
-        }
-
-        const results = await service.findContainerGlobal(container)
-
-        if (results.length === 0) {
-          return `未找到容器: ${container}`
-        }
-
-        const { node, container: c } = results[0]
-
-        if (c.State !== 'running') {
-          return `容器 ${container} 未运行`
-        }
-
-        const result = await node.execContainer(c.Id, cmd.split(' '))
-
-        return [
-          `=== ${node.name}/${c.Names[0]?.replace('/', '') || c.Id.slice(0, 8)} ===`,
-          `> ${cmd}`,
-          ``,
-          result.output || '(无输出)',
-          ``,
-          `[退出码: ${result.exitCode}]`,
         ].join('\n')
       } catch (e: any) {
         return `执行失败: ${e.message}`
@@ -261,15 +237,14 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.nodes               - 查看节点列表',
       '  docker.node <节点>         - 查看节点详情',
       '',
-      '【容器操作】',
-      '  docker.ls [节点]           - 列出容器',
-      '  docker.start <容器>        - 启动容器',
-      '  docker.stop <容器>         - 停止容器',
-      '  docker.restart <容器>      - 重启容器',
-      '  docker.logs <容器> [-t 行数] - 查看日志',
-      '  docker.find <容器>         - 搜索容器',
-      '  docker.exec <容器> <命令>  - 执行命令',
-      '  docker.shell <容器> <命令> - 交互式执行',
+      '【容器操作】(参数顺序: 节点 容器)',
+      '  docker.ls <节点>           - 列出容器',
+      '  docker.start <节点> <容器> - 启动容器',
+      '  docker.stop <节点> <容器>  - 停止容器',
+      '  docker.restart <节点> <容器> - 重启容器',
+      '  docker.logs <节点> <容器> [-n 行数] - 查看日志',
+      '  docker.inspect <节点> <容器> - 查看容器详情',
+      '  docker.exec <节点> <容器> <命令> - 在容器内执行命令',
       '',
       '【节点选择器】',
       '  all        - 所有节点',

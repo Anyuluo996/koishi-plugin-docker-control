@@ -68,11 +68,56 @@ export class DockerConnector {
           } catch (e) {
             // 可能已经关闭，忽略错误
           }
-          if (stderr.includes('Error') || stderr.includes('error')) {
-            reject(new Error(stderr.trim()))
+          // 非零退出码或包含错误信息时抛出异常
+          if (code !== 0 || stderr.includes('Error') || stderr.includes('error') || stderr.includes('No such file')) {
+            const errorMsg = stderr.trim() || `命令执行失败，退出码: ${code}`
+            reject(new Error(errorMsg))
           } else {
             resolve(stdout.trim())
           }
+        })
+
+        stream.on('data', (data: Buffer) => {
+          stdout += data.toString()
+        })
+
+        stream.on('err', (data: Buffer) => {
+          stderr += data.toString()
+        })
+      })
+    })
+  }
+
+  /**
+   * 执行命令并返回输出和退出码
+   */
+  async execWithExitCode(command: string): Promise<{ output: string; exitCode: number }> {
+    const client = await this.getConnection()
+
+    connectorLogger.debug(`[${this.config.name}] 执行命令: ${command}`)
+
+    return new Promise((resolve, reject) => {
+      client.exec(command, (err, stream) => {
+        if (err) {
+          connectorLogger.debug(`[${this.config.name}] 命令执行错误: ${err.message}`)
+          reject(err)
+          return
+        }
+
+        let stdout = ''
+        let stderr = ''
+        let exitCode: number | null = null
+
+        stream.on('close', (code: number, signal: string) => {
+          connectorLogger.debug(`[${this.config.name}] 命令完成: code=${code}, signal=${signal}`)
+          exitCode = code ?? 0
+          // 显式结束 stream 防止 channel 泄露
+          try {
+            stream.end()
+          } catch (e) {
+            // 可能已经关闭，忽略错误
+          }
+          resolve({ output: stdout.trim(), exitCode })
         })
 
         stream.on('data', (data: Buffer) => {
@@ -126,10 +171,10 @@ export class DockerConnector {
   /**
    * 执行容器内命令
    */
-  async execContainer(containerId: string, cmd: string): Promise<string> {
+  async execContainer(containerId: string, cmd: string): Promise<{ output: string; exitCode: number }> {
     // 使用 docker exec 需要处理引号
     const escapedCmd = cmd.replace(/'/g, "'\\''")
-    return this.exec(`docker exec ${containerId} sh -c '${escapedCmd}'`)
+    return this.execWithExitCode(`docker exec ${containerId} sh -c '${escapedCmd}'`)
   }
 
   /**
@@ -305,5 +350,67 @@ export class DockerConnector {
    */
   private getCredential(): CredentialConfig | undefined {
     return getCredentialById(this.fullConfig, this.config.credentialId)
+  }
+
+  /**
+   * 读取文件内容 (支持 Windows 路径和 WSL 路径自动转换)
+   * @param filePath 文件路径 (可能是 Windows 路径如 C:\xxx 或 WSL 路径如 /mnt/c/xxx)
+   * @returns 文件内容
+   */
+  async readFile(filePath: string): Promise<string> {
+    // 检测是否是 Windows 路径 (包含盘符如 C:\)
+    const isWindowsPath = /^[A-Za-z]:/.test(filePath)
+
+    if (isWindowsPath) {
+      // 第一次尝试使用原始路径
+      try {
+        return await this.readFileInternal(filePath)
+      } catch (originalError) {
+        // 如果失败，尝试转换为 WSL 路径
+        const wslPath = this.convertWindowsToWslPath(filePath)
+        connectorLogger.debug(`[${this.config.name}] 原始路径失败 (${filePath})，尝试 WSL 路径: ${wslPath}`)
+        return await this.readFileInternal(wslPath)
+      }
+    }
+
+    // 非 Windows 路径直接读取
+    return await this.readFileInternal(filePath)
+  }
+
+  /**
+   * 内部文件读取方法
+   */
+  private async readFileInternal(filePath: string): Promise<string> {
+    // 使用 cat 命令读取文件
+    // 对路径进行引号处理以支持包含空格的路径
+    const escapedPath = filePath.replace(/"/g, '\\"')
+    return this.exec(`cat "${escapedPath}"`)
+  }
+
+  /**
+   * 将 Windows 路径转换为 WSL 路径
+   * 例如: C:\Users\anyul\anyulapp\RSSHub\docker-compose.yml -> /mnt/c/Users/anyul/anyulapp/RSSHub/docker-compose.yml
+   */
+  convertWindowsToWslPath(windowsPath: string): string {
+    // 匹配 Windows 盘符路径 (如 C:\xxx 或 C:/xxx)
+    const match = windowsPath.match(/^([A-Za-z]):[\\/](.*)$/)
+    if (!match) {
+      // 如果不是有效的 Windows 路径，返回原路径
+      return windowsPath
+    }
+
+    const driveLetter = match[1].toLowerCase()
+    const restPath = match[2].replace(/\\/g, '/')
+
+    return `/mnt/${driveLetter}/${restPath}`
+  }
+
+  /**
+   * 检查文件是否存在
+   */
+  async fileExists(filePath: string): Promise<boolean> {
+    const escapedPath = filePath.replace(/"/g, '\\"')
+    const result = await this.execWithExitCode(`test -f "${escapedPath}" && echo "exists" || echo "not exists"`)
+    return result.output.trim() === 'exists'
   }
 }

@@ -115,6 +115,14 @@ const STYLE = `
   .detail-value.highlight {
     color: #60a5fa;
   }
+  .detail-span {
+    grid-column: 1 / -1;
+  }
+  .detail-span .detail-value {
+    white-space: pre-wrap;
+    font-size: 13px;
+    line-height: 1.6;
+  }
 
   /* 操作结果样式 */
   .result-card {
@@ -170,30 +178,35 @@ export async function renderToImage(ctx: Context, html: string, options: RenderO
   }
 
   return ctx.puppeteer.render(html, async (page, next) => {
-    // 设置适当的视口，高度设大一点以便 content 自适应，然后截图 clip
+    // 1. 设置初始视口
     await page.setViewport({
-      width: options.width || 700,
-      height: options.height || 1000,
-      deviceScaleFactor: 2 // 高清渲染
+      width: options.width || 800,
+      height: options.height || 100,
+      deviceScaleFactor: 2
     })
 
-    // 等待内容渲染
+    // 2. 等待内容渲染
     const body = await page.$('body')
     const wrapper = await page.$('.wrapper')
 
-    // 获取 wrapper 的实际大小
-    const clip = await wrapper?.boundingBox() || await body?.boundingBox()
+    // 3. 获取实际内容的高度
+    const boundingBox = await wrapper?.boundingBox() || await body?.boundingBox()
 
-    if (clip) {
-      // 增加一点 padding 截图
-      // clip.x -= 10
-      // clip.y -= 10
-      // clip.width += 20
-      // clip.height += 20
+    if (boundingBox) {
+      // 调整视口高度以匹配内容
+      await page.setViewport({
+        width: options.width || 800,
+        height: Math.ceil(boundingBox.height) + 100,
+        deviceScaleFactor: 2
+      })
 
-      // 直接截取 content
-      const buffer = await page.screenshot({ clip })
-      return h.image(buffer, 'image/png').toString()
+      // 重新获取 clip (因为视口变化可能导致重绘)
+      const finalClip = await wrapper?.boundingBox() || await body?.boundingBox()
+
+      if (finalClip) {
+        const buffer = await page.screenshot({ clip: finalClip })
+        return h.image(buffer, 'image/png').toString()
+      }
     }
 
     // Fallback
@@ -320,27 +333,63 @@ export function generateInspectHtml(
   const shortId = info.Id.slice(0, 12)
   const isRunning = info.State.Running
 
+  // 网络信息
+  const networks = info.NetworkSettings?.Networks
+  const networkInfo = networks && Object.keys(networks).length > 0
+    ? Object.entries(networks).map(([name, net]) => {
+        const n = net as any
+        const ip = n.IPAddress || '-'
+        const gateway = n.Gateway || '-'
+        return `  ${name}: ${ip} (GW: ${gateway})`
+      }).join('\n')
+    : '-'
+
+  // 环境变量
+  const envVars = info.Config?.Env || []
+  const envDisplay = envVars.length > 0
+    ? envVars.slice(0, 10).map(e => {
+        const [key, ...val] = e.split('=')
+        return `  ${key}=${val.join('=').slice(0, 50)}${val.join('=').length > 50 ? '...' : ''}`
+      }).join('\n') + (envVars.length > 10 ? `\n  ... (共 ${envVars.length} 个)` : '')
+    : '-'
+
+  // 重启策略
+  const restartPolicy = info.HostConfig?.RestartPolicy
+  const restartDisplay = restartPolicy
+    ? `${restartPolicy.Name}${restartPolicy.Name !== 'no' ? ` (最大 ${restartPolicy.MaximumRetryCount} 次重试)` : ''}`
+    : 'no'
+
+  // 挂载目录
+  const mounts = info.Mounts || []
+  const mountsDisplay = mounts.length > 0
+    ? mounts.map((m) => {
+        const mount = m as any
+        return `  ${mount.Source} → ${mount.Destination} (${mount.Type})`
+      }).join('\n')
+    : '-'
+
   const items = [
-    { label: '容器名称', value: name },
-    { label: '容器 ID', value: info.Id },
-    { label: '镜像', value: info.Config.Image },
-    { label: '状态', value: info.State.Status, highlight: true },
-    { label: '创建时间', value: new Date(info.Created).toLocaleString() },
-    { label: '启动时间', value: new Date(info.State.StartedAt).toLocaleString() },
-    { label: '重启次数', value: info.RestartCount },
-    { label: 'IP 地址', value: info.NetworkSettings?.IPAddress || '-' },
-    { label: '平台', value: info.Platform || 'linux' },
-    { label: '驱动', value: info.Driver },
+    { label: '容器名称', value: name, span: false },
+    { label: '容器 ID', value: info.Id, span: false },
+    { label: '镜像', value: info.Config.Image, span: false },
+    { label: '状态', value: info.State.Status, highlight: true, span: false },
+    { label: '创建时间', value: new Date(info.Created).toLocaleString(), span: false },
+    { label: '启动时间', value: new Date(info.State.StartedAt).toLocaleString(), span: false },
+    { label: '重启策略', value: restartDisplay, span: false },
+    { label: '重启次数', value: String(info.RestartCount), span: false },
+    { label: '网络', value: networkInfo, span: true },
+    { label: '环境变量', value: envDisplay, span: true },
+    { label: '挂载目录', value: mountsDisplay, span: true },
   ]
 
   if (info.State.Health) {
-    items.push({ label: '健康状态', value: info.State.Health.Status, highlight: true })
+    items.push({ label: '健康状态', value: info.State.Health.Status, highlight: true, span: false })
   }
 
   const gridItems = items.map(item => `
-    <div class="detail-item">
+    <div class="detail-item ${item.span ? 'detail-span' : ''}">
       <div class="detail-label">${item.label}</div>
-      <div class="detail-value ${item.highlight ? 'highlight' : ''}">${item.value}</div>
+      <div class="detail-value ${item.highlight ? 'highlight' : ''}">${item.value.replace(/\n/g, '<br>')}</div>
     </div>
   `).join('')
 
@@ -365,7 +414,6 @@ export function generateInspectHtml(
           ${gridItems}
         </div>
       </div>
-      <!--Mounts/Ports could be added here-->
     </div>
   `
 
@@ -378,24 +426,30 @@ export function generateInspectHtml(
 export function generateNodesHtml(
   nodes: any[]
 ): string {
-  const onlineCount = nodes.filter(n => n.status === 'connected').length
+  // 兼容字段名称
+  const getStatus = (n: any) => n.status || n.Status || 'unknown'
+  const getName = (n: any) => n.name || n.Name || 'Unknown'
+  const getId = (n: any) => n.id || n.ID || n.Id || '-'
+
+  const onlineCount = nodes.filter(n => getStatus(n) === 'connected').length
   const totalCount = nodes.length
 
   const listItems = nodes.map(n => {
-    const isOnline = n.status === 'connected'
-    const isConnecting = n.status === 'connecting'
+    const status = getStatus(n)
+    const isOnline = status === 'connected' || status === 'running'
+    const isConnecting = status === 'connecting'
     const icon = isOnline ? '🟢' : (isConnecting ? '🟡' : '🔴')
-    const tags = n.tags.map((t: string) => `<span class="tag">@${t}</span>`).join(' ')
+    const tags = (n.tags || []).map((t: string) => `<span class="tag">@${t}</span>`).join(' ')
 
     return `
       <div class="list-item">
         <div class="status-icon">${icon}</div>
         <div class="name-col">
-          <div>${n.name}</div>
-          <div style="font-size:12px; opacity:0.6; margin-top:2px;">${n.id}</div>
+          <div>${getName(n)}</div>
+          <div style="font-size:12px; opacity:0.6; margin-top:2px;">${getId(n)}</div>
         </div>
         <div class="meta-col">
-          <div style="color: ${isOnline ? '#4ade80' : (isConnecting ? '#facc15' : '#f87171')}">${n.status}</div>
+          <div style="color: ${isOnline ? '#4ade80' : (isConnecting ? '#facc15' : '#f87171')}">${status}</div>
         </div>
         <div>${tags}</div>
       </div>
@@ -417,28 +471,53 @@ export function generateNodesHtml(
  */
 export function generateNodeDetailHtml(
   node: any,
-  version: any
+  version: any,
+  systemInfo?: any
 ): string {
-  const isOnline = node.status === 'connected'
+  // 兼容字段名称 (处理大小写不一致的问题)
+  // 优先从 config 获取名称，因为 node 对象可能是 DockerNode 实例
+  const nodeName = node.config?.name || node.name || node.Name || 'Unknown'
+  const nodeId = node.id || node.ID || node.Id || node.config?.id || '-'
+  const nodeStatus = node.status || node.Status || 'unknown'
+  const nodeTags = node.tags || node.config?.tags || []
+  const isOnline = nodeStatus === 'connected' || nodeStatus === 'running'
+
+  // 解析系统信息 (兼容不同字段格式)
+  const cpuCores = systemInfo?.NCPU || systemInfo?.Ncpu || systemInfo?.ncpu || '-'
+  const memoryTotal = systemInfo?.MemTotal ? formatBytes(systemInfo.MemTotal) : '-'
+  // 如果没有 MemAvailable，则只显示总内存
+  const memoryDisplay = systemInfo?.MemAvailable !== undefined
+    ? `${formatBytes(systemInfo.MemAvailable)} / ${memoryTotal}`
+    : memoryTotal !== '-' ? memoryTotal : '-'
 
   // 基础信息
   const items = [
-    { label: '节点名称', value: node.name },
-    { label: '节点 ID', value: node.id },
-    { label: '状态', value: node.status, highlight: isOnline },
-    { label: '标签', value: node.tags.join(', ') || '(无)' },
+    { label: '节点名称', value: nodeName },
+    { label: '节点 ID', value: nodeId },
+    { label: '状态', value: nodeStatus, highlight: isOnline },
+    { label: '标签', value: (nodeTags || []).join(', ') || '(无)' },
   ]
+
+  // 系统资源信息
+  items.push(
+    { label: 'CPU', value: `${cpuCores} 核心` },
+    { label: '内存', value: memoryDisplay },
+    { label: '容器数量', value: String(node.containerCount ?? node.Containers ?? node.containers ?? '-') },
+    { label: '镜像数量', value: String(node.imageCount ?? node.Images ?? node.images ?? '-') },
+  )
+
+  // 集群信息
+  if (node.cluster || node.Swarm?.NodeID) {
+    items.push({ label: '集群', value: node.cluster || 'Swarm Mode' })
+  }
 
   // 版本信息
   if (version) {
     items.push(
-      { label: 'Docker 版本', value: version.Version },
-      { label: 'API 版本', value: version.ApiVersion },
-      { label: '操作系统', value: `${version.Os} (${version.Arch})` },
-      { label: '内核版本', value: version.KernelVersion },
-      { label: 'Go 版本', value: version.GoVersion },
-      { label: 'Git Commit', value: version.GitCommit },
-      { label: '构建时间', value: version.BuildTime }
+      { label: 'Docker 版本', value: version.Version || version.version || '-' },
+      { label: 'API 版本', value: version.ApiVersion || version.ApiVersion || '-' },
+      { label: '操作系统', value: `${version.Os || version.Os || 'unknown'} (${version.Arch || version.Arch || 'unknown'})` },
+      { label: '内核版本', value: version.KernelVersion || version.KernelVersion || '-' }
     )
   }
 
@@ -452,7 +531,7 @@ export function generateNodeDetailHtml(
   const header = `
     <div class="header">
       <div class="header-title">节点详情</div>
-      <div class="header-badge">${node.name}</div>
+      <div class="header-badge">${nodeName}</div>
     </div>
   `
 
@@ -462,8 +541,8 @@ export function generateNodeDetailHtml(
         <div style="display: flex; align-items: center; margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.1);">
           <div style="font-size: 32px; margin-right: 16px;">${isOnline ? '🟢' : '🔴'}</div>
           <div>
-            <div style="font-size: 20px; font-weight: 600;">${node.name}</div>
-            <div style="font-size: 13px; color: #94a3b8; font-family: monospace;">${node.id}</div>
+            <div style="font-size: 20px; font-weight: 600;">${nodeName}</div>
+            <div style="font-size: 13px; color: #94a3b8; font-family: monospace;">${nodeId}</div>
           </div>
         </div>
         <div class="detail-grid">
@@ -474,4 +553,374 @@ export function generateNodeDetailHtml(
   `
 
   return wrapHtml(header + body)
+}
+
+/**
+ * 生成日志 HTML
+ */
+export function generateLogsHtml(
+  nodeName: string,
+  containerName: string,
+  logs: string,
+  lineCount: number
+): string {
+  // 限制日志行数，避免过长
+  const maxLines = 150
+  const allLines = logs.split('\n')
+  const totalLines = allLines.length
+  const displayLines = allLines.slice(-maxLines)
+  const displayLogs = displayLines.join('\n')
+  const displayLineCount = displayLines.length
+
+  // 逐行渲染，带行号和高亮
+  const logLines = displayLines.map((line, idx) => {
+    const lineNum = totalLines - displayLineCount + idx + 1
+    return `<span class="line-num">${lineNum.toString().padStart(5, ' ')}</span><span class="line-content">${highlightLogContent(line)}</span>`
+  }).join('\n')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">📋 容器日志</div>
+      <div class="header-badge">${nodeName}/${containerName}</div>
+    </div>
+  `
+
+  const body = `
+    <div class="content">
+      <div style="margin-bottom: 12px; font-size: 13px; color: #94a3b8; display: flex; justify-content: space-between;">
+        <span>显示第 ${totalLines - displayLineCount + 1} - ${totalLines} 行</span>
+        <span>共 ${totalLines} 行</span>
+      </div>
+      <div class="log-container">
+        <div class="log-lines">${logLines}</div>
+      </div>
+    </div>
+  `
+
+  // 添加日志专用样式
+  const logStyle = `
+    .log-container {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 8px;
+      padding: 16px;
+      overflow: visible;
+    }
+    .log-lines {
+      font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #e2e8f0;
+    }
+    .line-num {
+      color: #475569;
+      margin-right: 12px;
+      user-select: none;
+      display: inline-block;
+      min-width: 35px;
+      text-align: right;
+      border-right: 1px solid #334155;
+      padding-right: 8px;
+    }
+    .line-content {
+      color: #e2e8f0;
+    }
+
+    /* 高亮样式 */
+    .hl-date { color: #64748b; }
+    .hl-ip { color: #22d3ee; }
+    .hl-string { color: #a5f3fc; opacity: 0.9; }
+    .hl-error { color: #ef4444; font-weight: bold; background: rgba(239, 68, 68, 0.1); padding: 0 4px; border-radius: 2px; }
+    .hl-warn { color: #f59e0b; font-weight: bold; }
+    .hl-info { color: #3b82f6; font-weight: bold; }
+    .hl-debug { color: #94a3b8; }
+  `
+
+  return wrapHtml(header + body, STYLE + logStyle)
+}
+
+/**
+ * 格式化字节为可读格式
+ */
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes < 0) return '-'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+/**
+ * HTML 转义
+ */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+}
+
+/**
+ * 处理日志高亮
+ */
+function highlightLogContent(text: string): string {
+  // 1. 先进行基础的 HTML 转义
+  let html = escapeHtml(text)
+
+  // 2. 定义高亮规则 (注意顺序：先匹配复杂的，再匹配简单的)
+
+  // [时间戳] YYYY-MM-DD HH:mm:ss 或 ISO8601
+  html = html.replace(
+    /(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/g,
+    '\x1f$1\x1f'
+  )
+
+  // [IP地址] 简单的 IPv4 匹配
+  html = html.replace(
+    /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
+    '\x1f$&\x1f'
+  )
+
+  // [日志等级 - Error/Fail] 红色
+  html = html.replace(
+    /(\b(ERROR|ERR|FATAL|CRITICAL|FAIL|FAILED|EXCEPTION)\b|\[(ERROR|ERR)\])/gi,
+    '\x1f$1\x1f'
+  )
+
+  // [日志等级 - Warn] 黄色
+  html = html.replace(
+    /(\b(WARN|WARNING)\b|\[(WARN|WARNING)\])/gi,
+    '\x1f$1\x1f'
+  )
+
+  // [日志等级 - Info] 蓝色
+  html = html.replace(
+    /(\b(INFO|INFORMATION)\b|\[(INFO)\])/gi,
+    '\x1f$1\x1f'
+  )
+
+  // [日志等级 - Debug/Trace] 灰色
+  html = html.replace(
+    /(\b(DEBUG|TRACE)\b|\[(DEBUG|TRACE)\])/gi,
+    '\x1f$1\x1f'
+  )
+
+  // [引用/字符串] "xxx" 或 'xxx'
+  html = html.replace(
+    /(".*?"|'.*?')/g,
+    '\x1f$1\x1f'
+  )
+
+  // 3. 将占位符替换回 HTML 标签
+  html = html
+    .replace(/\x1f(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\x1f/g, '<span class="hl-date">$1</span>')
+    .replace(/\x1f((?:\d{1,3}\.){3}\d{1,3})\x1f/g, '<span class="hl-ip">$1</span>')
+    .replace(/\x1f((?:\[[^\]]*\]|\w+))\x1f/g, (match, p1) => {
+      const lower = p1.toLowerCase()
+      if (lower.includes('error') || lower.includes('fatal') || lower.includes('fail') || lower.includes('exception')) {
+        return `<span class="hl-error">${p1}</span>`
+      }
+      if (lower.includes('warn')) {
+        return `<span class="hl-warn">${p1}</span>`
+      }
+      if (lower.includes('info')) {
+        return `<span class="hl-info">${p1}</span>`
+      }
+      if (lower.includes('debug') || lower.includes('trace')) {
+        return `<span class="hl-debug">${p1}</span>`
+      }
+      if (p1.startsWith('"') || p1.startsWith("'")) {
+        return `<span class="hl-string">${p1}</span>`
+      }
+      return p1
+    })
+
+  return html
+}
+
+/**
+ * 生成执行结果 HTML
+ */
+export function generateExecHtml(
+  nodeName: string,
+  containerName: string,
+  command: string,
+  output: string,
+  exitCode: number
+): string {
+  const isSuccess = exitCode === 0
+  const statusIcon = isSuccess ? '✅' : '❌'
+
+  const header = `
+    <div class="header">
+      <div class="header-title">🔧 命令执行</div>
+      <div class="header-badge">${nodeName}/${containerName}</div>
+    </div>
+  `
+
+  const body = `
+    <div class="content">
+      <div style="
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+      ">
+        <div style="font-size: 13px; color: #94a3b8; margin-bottom: 8px;">执行命令</div>
+        <div style="
+          font-family: 'SF Mono', Monaco, monospace;
+          font-size: 13px;
+          color: #60a5fa;
+          background: rgba(96, 165, 250, 0.1);
+          padding: 8px 12px;
+          border-radius: 4px;
+        ">${command}</div>
+      </div>
+
+      <div style="
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 8px;
+        padding: 16px;
+        font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        max-height: 300px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #e2e8f0;
+      ">${output || '(无输出)'}</div>
+
+      <div style="margin-top: 16px; display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 20px;">${statusIcon}</span>
+        <span style="color: ${isSuccess ? '#4ade80' : '#f87171'}">
+          退出码: ${exitCode}
+        </span>
+      </div>
+    </div>
+  `
+
+  return wrapHtml(header + body)
+}
+
+/**
+ * 生成 Docker Compose 配置 HTML
+ */
+export function generateComposeHtml(
+  nodeName: string,
+  containerName: string,
+  projectName: string,
+  filePath: string,
+  serviceCount: number,
+  composeContent: string
+): string {
+  // 对内容进行语法高亮
+  const highlightedContent = highlightYaml(composeContent)
+
+  const header = `
+    <div class="header">
+      <div class="header-title">Docker Compose</div>
+      <div class="header-badge">${nodeName}/${containerName}</div>
+    </div>
+  `
+
+  const body = `
+    <div class="content">
+      <div class="detail-card" style="margin-bottom: 20px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+          <div class="detail-item">
+            <div class="detail-label">项目名称</div>
+            <div class="detail-value highlight">${projectName}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">服务数量</div>
+            <div class="detail-value">${serviceCount} 个</div>
+          </div>
+          <div class="detail-item" style="grid-column: 1 / -1;">
+            <div class="detail-label">文件路径</div>
+            <div class="detail-value" style="font-size: 13px;">${filePath}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 8px;
+        padding: 16px;
+        font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-all;
+      ">${highlightedContent}</div>
+    </div>
+  `
+
+  // 添加 YAML 高亮样式
+  const yamlStyle = `
+    .yaml-key { color: #60a5fa; }
+    .yaml-string { color: #a5f3fc; }
+    .yaml-number { color: #f472b6; }
+    .yaml-boolean { color: #fbbf24; }
+    .yaml-null { color: #94a3b8; }
+    .yaml-comment { color: #64748b; font-style: italic; }
+    .yaml-bracket { color: #f87171; }
+  `
+
+  return wrapHtml(header + body, STYLE + yamlStyle)
+}
+
+/**
+ * 简单的 YAML 语法高亮
+ */
+function highlightYaml(content: string): string {
+  // HTML 转义
+  let html = escapeHtml(content)
+
+  // 高亮键名 (冒号前的单词)
+  html = html.replace(
+    /^([a-zA-Z0-9_-]+):(\s*)$/gm,
+    '<span class="yaml-key">$1</span>:<br>'
+  )
+
+  // 高亮带引号的字符串
+  html = html.replace(
+    /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g,
+    '<span class="yaml-string">$1</span>'
+  )
+
+  // 高亮数字
+  html = html.replace(
+    /\b(\d+\.?\d*)\b/g,
+    '<span class="yaml-number">$1</span>'
+  )
+
+  // 高亮布尔值
+  html = html.replace(
+    /\b(true|false|yes|no|on|off)\b/gi,
+    '<span class="yaml-boolean">$1</span>'
+  )
+
+  // 高亮 null
+  html = html.replace(
+    /\bnull\b/gi,
+    '<span class="yaml-null">null</span>'
+  )
+
+  // 高亮注释
+  html = html.replace(
+    /#.*$/gm,
+    '<span class="yaml-comment">$&</span>'
+  )
+
+  // 高亮括号
+  html = html.replace(
+    /([\[\]{}()])/g,
+    '<span class="yaml-bracket">$1</span>'
+  )
+
+  return html
 }

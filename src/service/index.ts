@@ -278,4 +278,23 @@ export class DockerService {
     this.eventCallbacks.clear()
     logger.info('Docker 服务已停止')
   }
+
+  /**
+   * 获取所有在线节点的容器聚合
+   */
+  async getAggregatedContainers(all = true): Promise<Array<{ node: DockerNode; containers: ContainerInfo[] }>> {
+    const results: Array<{ node: DockerNode; containers: ContainerInfo[] }> = []
+
+    for (const node of this.getOnlineNodes()) {
+      try {
+        const containers = await node.listContainers(all)
+        results.push({ node, containers })
+      } catch (e) {
+        logger.warn(`[${node.name}] 获取容器列表失败: ${e}`)
+        results.push({ node, containers: [] })
+      }
+    }
+
+    return results
+  }
 }
