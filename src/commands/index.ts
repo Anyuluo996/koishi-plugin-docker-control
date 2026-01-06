@@ -10,6 +10,8 @@ import { registerComposeCommand } from './compose'
 import { registerResourceCommands } from './resources'
 import { registerUpdateCommands } from './update'
 import { registerClusterCommands } from './cluster'
+import { registerAuditCommands } from './audit'
+import { registerPermissionCommands } from './permission'
 import { generateNodesHtml, generateNodeDetailHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
@@ -33,6 +35,10 @@ export function registerCommands(
   registerResourceCommands(ctx, getService, config)
   registerUpdateCommands(ctx, getService)
   registerClusterCommands(ctx, getService, config)
+
+  // v0.1.0 新增指令
+  registerAuditCommands(ctx, getService)
+  registerPermissionCommands(ctx, getService)
 
   // 注册辅助指令
   registerHelperCommands(ctx, getService, config)
@@ -268,6 +274,20 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.images <节点>       - 查看镜像列表 [-f image]',
       '  docker.networks <节点>     - 查看网络列表 [-f image]',
       '  docker.volumes <节点>      - 查看存储卷列表 [-f image]',
+      '',
+      '【v0.1.0 审计日志】',
+      '  docker.audit.log           - 查看审计日志 [-u 用户] [-a 操作] [-r 结果] [-l 条数]',
+      '  docker.audit.stats         - 审计日志统计',
+      '  docker.audit.cleanup       - 清理旧日志 [-d 天数]',
+      '  docker.audit.export        - 导出审计日志 (CSV)',
+      '',
+      '【v0.1.0 权限管理】',
+      '  docker.permission.user <userId>       - 查看用户权限',
+      '  docker.permission.setrole <userId> <role...> - 设置用户角色',
+      '  docker.permission.addnode <userId> <nodeId> <perm...> - 添加节点权限',
+      '  docker.permission.removenode <userId> <nodeId> <perm...> - 移除节点权限',
+      '  docker.permission.roles              - 列出所有角色',
+      '  docker.permission.check <userId> <resource> <action> - 检查权限',
       '',
       '【节点选择器】',
       '  all        - 所有节点',

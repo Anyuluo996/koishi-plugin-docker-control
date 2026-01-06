@@ -6,6 +6,9 @@ import { Context } from 'koishi'
 import type { DockerEvent, DockerControlConfig, ContainerInfo } from '../types'
 import { DockerNode } from './node'
 import { logger } from '../utils/logger'
+import { PermissionManager } from './permission-manager'
+import { AuditLogger } from './audit-logger'
+import { ReconnectManager } from './reconnect-manager'
 
 export class DockerService {
   /** Koishi Context */
@@ -16,6 +19,11 @@ export class DockerService {
   private readonly config: DockerControlConfig
   /** 全局事件回调集合 - 事件中转站 */
   private eventCallbacks: Set<(event: DockerEvent, nodeId: string) => void> = new Set()
+
+  // v0.1.0 新增服务实例
+  public permissionManager?: PermissionManager
+  public auditLogger?: AuditLogger
+  public reconnectManager?: ReconnectManager
 
   constructor(ctx: Context, config: DockerControlConfig) {
     this.ctx = ctx
@@ -60,6 +68,10 @@ export class DockerService {
       promises.push(
         node.connect().catch((e) => {
           logger.warn(`节点 ${node.name} 连接失败: ${e}`)
+          // 如果连接失败且启用了自动重连，开始重连
+          if (this.reconnectManager) {
+            this.handleNodeDisconnection(node)
+          }
         })
       )
     }
@@ -74,6 +86,47 @@ export class DockerService {
     ).length
 
     logger.info(`连接完成: ${online} 在线, ${offline} 离线`)
+
+    // v0.1.0 新增: 为所有节点设置断线监听
+    this.setupReconnectHandlers()
+  }
+
+  /**
+   * 设置自动重连处理器
+   */
+  private setupReconnectHandlers(): void {
+    if (!this.reconnectManager) {
+      logger.debug('自动重连未启用，跳过重连处理器设置')
+      return
+    }
+
+    logger.info('设置节点自动重连监听器...')
+
+    // 监听所有节点的事件
+    for (const node of this.nodes.values()) {
+      node.onEvent((event) => {
+        // 监听节点离线事件
+        if (event.Type === 'node' && event.Action === 'offline') {
+          logger.warn(`节点 ${node.name} (${node.id}) 已离线，触发自动重连`)
+          this.handleNodeDisconnection(node)
+        }
+      })
+    }
+  }
+
+  /**
+   * 处理节点断线连接
+   */
+  private async handleNodeDisconnection(node: DockerNode): Promise<void> {
+    if (!this.reconnectManager) return
+
+    try {
+      logger.info(`开始重连节点 ${node.name}...`)
+      await this.reconnectManager.reconnect(node)
+      logger.info(`节点 ${node.name} 重连成功`)
+    } catch (e) {
+      logger.error(`节点 ${node.name} 重连失败: ${e.message}`)
+    }
   }
 
   /**

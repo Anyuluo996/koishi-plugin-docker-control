@@ -59,6 +59,52 @@ export const NodeSchema: Schema<NodeConfig> = Schema.object({
   credentialId: Schema.string().required().description('SSH 凭证 ID'),
 })
 
+// ==================== 增强功能 Schema ====================
+
+const ConnectionPoolSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用连接池'),
+  maxConnectionsPerNode: Schema.number().default(5).description('每个节点最大连接数'),
+  minConnectionsPerNode: Schema.number().default(1).description('每个节点最小连接数'),
+  connectionTimeout: Schema.number().default(30000).description('连接超时 (毫秒)'),
+  idleTimeout: Schema.number().default(300000).description('空闲连接超时 (毫秒)'),
+  healthCheckInterval: Schema.number().default(60000).description('健康检查间隔 (毫秒)'),
+})
+
+const CacheSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用缓存'),
+  defaultTTL: Schema.number().default(30000).description('默认缓存时间 (毫秒)'),
+  cleanupInterval: Schema.number().default(60000).description('清理间隔 (毫秒)'),
+  maxCacheSize: Schema.number().default(1000).description('最大缓存条目数'),
+})
+
+const PermissionSchema = Schema.object({
+  enabled: Schema.boolean().default(false).description('启用权限控制'),
+  defaultRole: Schema.union(['viewer', 'operator', 'admin'] as const)
+    .default('viewer')
+    .description('默认角色'),
+  adminUsers: Schema.array(Schema.string()).default([]).description('管理员用户 ID 列表'),
+})
+
+const AuditSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用审计日志'),
+  retentionDays: Schema.number().default(90).description('日志保留天数'),
+  sensitiveFields: Schema.array(Schema.string()).default(['password', 'privateKey', 'passphrase']).description('敏感字段列表'),
+})
+
+const ReconnectSchema = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用自动重连'),
+  maxAttempts: Schema.number().default(10).description('最大重试次数'),
+  initialDelay: Schema.number().default(1000).description('初始重试延迟 (毫秒)'),
+  maxDelay: Schema.number().default(60000).description('最大重试延迟 (毫秒)'),
+  heartbeatInterval: Schema.number().default(30000).description('心跳检测间隔 (毫秒)'),
+})
+
+const RetrySchema = Schema.object({
+  maxAttempts: Schema.number().default(3).description('最大重试次数'),
+  initialDelay: Schema.number().default(1000).description('初始重试延迟 (毫秒)'),
+  maxDelay: Schema.number().default(10000).description('最大重试延迟 (毫秒)'),
+})
+
 // ==================== 完整配置 Schema ====================
 
 export const ConfigSchema = Schema.object({
@@ -66,6 +112,18 @@ export const ConfigSchema = Schema.object({
     .default(30000)
     .description('全局请求超时 (毫秒)'),
   debug: Schema.boolean().default(false).description('调试模式'),
+  imageOutput: Schema.boolean().default(false).description('使用图片格式输出'),
+  defaultLogLines: Schema.number().default(100).description('默认日志显示的行数'),
+
+  // 增强功能
+  connectionPool: ConnectionPoolSchema.description('连接池配置'),
+  cache: CacheSchema.description('缓存配置'),
+  permissions: PermissionSchema.description('权限控制配置'),
+  audit: AuditSchema.description('审计日志配置'),
+  reconnect: ReconnectSchema.description('自动重连配置'),
+  retry: RetrySchema.description('错误重试配置'),
+
+  // 原有配置
   credentials: Schema.array(CredentialSchema)
     .default([])
     .description('SSH 凭证列表'),
@@ -74,6 +132,13 @@ export const ConfigSchema = Schema.object({
     .description('Docker 节点列表'),
   notification: NotificationSchema
     .description('通知配置'),
+
+  // 监控策略
+  monitor: Schema.object({
+    debounceWait: Schema.number().default(60000).description('容器意外停止后等待重启的时间 (ms)'),
+    flappingWindow: Schema.number().default(300000).description('检测抖动/频繁重启的时间窗口 (ms)'),
+    flappingThreshold: Schema.number().default(3).description('时间窗口内允许的最大状态变更次数'),
+  }).description('监控策略设置'),
 })
 
 // ==================== 辅助函数 ====================

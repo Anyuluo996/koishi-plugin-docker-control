@@ -5,6 +5,8 @@
 import { Command, Context } from 'koishi'
 import { commandLogger } from '../utils/logger'
 import { generateResultHtml, generateInspectHtml, generateExecHtml, renderToImage } from '../utils/render'
+import { withAuditLog } from '../service/audit-logger'
+import { checkPermission } from '../utils/permission-check'
 
 /**
  * 格式化网络流量显示
@@ -61,7 +63,7 @@ export function registerControlCommands(
     .command('docker.start <selector> <container>', '启动容器')
     .alias('容器启动', '启动', '容器开启')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
-    .action(async ({ options }, selector, container) => {
+    .action(async ({ options, session }, selector, container) => {
       commandLogger.debug(`docker.start 被调用: selector=${selector}, container=${container}`)
       const service = getService()
       if (!service) {
@@ -69,52 +71,78 @@ export function registerControlCommands(
         return 'Docker 服务未初始化'
       }
 
-      try {
-        if (container === '*') {
-          commandLogger.debug('批量启动容器')
-          // 批量操作
-          const results = await service.operateContainers(
+      // v0.1.0 权限检查
+      if (service.permissionManager) {
+        const permResult = await checkPermission(session, {
+          permissionManager: service.permissionManager,
+          resource: 'container',
+          action: 'start'
+        })
+        if (!permResult.allowed) {
+          return `❌ ${permResult.error}`
+        }
+      }
+
+      // 审计日志包装
+      const executeStart = async () => {
+        try {
+          if (container === '*') {
+            commandLogger.debug('批量启动容器')
+            // 批量操作
+            const results = await service.operateContainers(
+              selector,
+              container,
+              'start'
+            )
+
+            if (useImageOutput && ctx.puppeteer) {
+              const html = generateResultHtml(results, '批量启动结果')
+              return await renderToImage(ctx, html)
+            }
+
+            return formatSearchResults(results, '启动')
+          }
+
+          // 单个容器
+          commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
+          const { node, container: found } = await service.findContainer(
             selector,
-            container,
-            'start'
+            container
           )
+          commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
+
+          await node.startContainer(found.Id)
+          commandLogger.debug(`容器已启动: ${found.Id}`)
 
           if (useImageOutput && ctx.puppeteer) {
-            const html = generateResultHtml(results, '批量启动结果')
+            const results = [{ node, container: found, success: true }]
+            const html = generateResultHtml(results, '启动成功')
             return await renderToImage(ctx, html)
           }
 
-          return formatSearchResults(results, '启动')
+          const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
+          return `✅ ${node.name}: ${name} 已启动`
+        } catch (e: any) {
+          commandLogger.error(`启动容器失败: ${e.message}`)
+          if (useImageOutput && ctx.puppeteer) {
+            return `❌ 启动失败: ${e.message}`
+          }
+          throw e
         }
-
-        // 单个容器
-        commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
-        const { node, container: found } = await service.findContainer(
-          selector,
-          container
-        )
-        commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
-
-        await node.startContainer(found.Id)
-        commandLogger.debug(`容器已启动: ${found.Id}`)
-
-        if (useImageOutput && ctx.puppeteer) {
-          const results = [{ node, container: found, success: true }]
-          const html = generateResultHtml(results, '启动成功')
-          return await renderToImage(ctx, html)
-        }
-
-        const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
-        return `✅ ${node.name}: ${name} 已启动`
-      } catch (e: any) {
-        commandLogger.error(`启动容器失败: ${e.message}`)
-        if (useImageOutput && ctx.puppeteer) {
-          // 尝试构造一个失败的结果用于渲染，虽然这里可能没有 node/container 信息
-          // 如果找不到容器，e 可能是 "找不到容器"
-          return `❌ 启动失败: ${e.message}`
-        }
-        return `❌ 启动失败: ${e.message}`
       }
+
+      // 使用审计日志包装
+      if (service.auditLogger) {
+        return withAuditLog(
+          service.auditLogger,
+          'container.start',
+          session,
+          executeStart,
+          { selector, container }
+        )
+      }
+
+      return executeStart()
     })
 
   /**
@@ -124,7 +152,7 @@ export function registerControlCommands(
     .command('docker.stop <selector> <container>', '停止容器')
     .alias('容器停止', '停止', '容器关闭')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
-    .action(async ({ options }, selector, container) => {
+    .action(async ({ options, session }, selector, container) => {
       commandLogger.debug(`docker.stop 被调用: selector=${selector}, container=${container}`)
       const service = getService()
       if (!service) {
@@ -132,46 +160,73 @@ export function registerControlCommands(
         return 'Docker 服务未初始化'
       }
 
-      try {
-        if (container === '*') {
-          commandLogger.debug('批量停止容器')
-          // 批量操作
-          const results = await service.operateContainers(
+      // v0.1.0 权限检查
+      if (service.permissionManager) {
+        const permResult = await checkPermission(session, {
+          permissionManager: service.permissionManager,
+          resource: 'container',
+          action: 'stop'
+        })
+        if (!permResult.allowed) {
+          return `❌ ${permResult.error}`
+        }
+      }
+
+      // 审计日志包装
+      const executeStop = async () => {
+        try {
+          if (container === '*') {
+            commandLogger.debug('批量停止容器')
+            const results = await service.operateContainers(
+              selector,
+              container,
+              'stop'
+            )
+
+            if (useImageOutput && ctx.puppeteer) {
+              const html = generateResultHtml(results, '批量停止结果')
+              return await renderToImage(ctx, html)
+            }
+
+            return formatSearchResults(results, '停止')
+          }
+
+          commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
+          const { node, container: found } = await service.findContainer(
             selector,
-            container,
-            'stop'
+            container
           )
+          commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
+
+          await node.stopContainer(found.Id)
+          commandLogger.debug(`容器已停止: ${found.Id}`)
 
           if (useImageOutput && ctx.puppeteer) {
-            const html = generateResultHtml(results, '批量停止结果')
+            const results = [{ node, container: found, success: true }]
+            const html = generateResultHtml(results, '停止成功')
             return await renderToImage(ctx, html)
           }
 
-          return formatSearchResults(results, '停止')
+          const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
+          return `✅ ${node.name}: ${name} 已停止`
+        } catch (e: any) {
+          commandLogger.error(`停止容器失败: ${e.message}`)
+          throw e
         }
-
-        commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
-        const { node, container: found } = await service.findContainer(
-          selector,
-          container
-        )
-        commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
-
-        await node.stopContainer(found.Id)
-        commandLogger.debug(`容器已停止: ${found.Id}`)
-
-        if (useImageOutput && ctx.puppeteer) {
-          const results = [{ node, container: found, success: true }]
-          const html = generateResultHtml(results, '停止成功')
-          return await renderToImage(ctx, html)
-        }
-
-        const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
-        return `✅ ${node.name}: ${name} 已停止`
-      } catch (e: any) {
-        commandLogger.error(`停止容器失败: ${e.message}`)
-        return `❌ 停止失败: ${e.message}`
       }
+
+      // 使用审计日志包装
+      if (service.auditLogger) {
+        return withAuditLog(
+          service.auditLogger,
+          'container.stop',
+          session,
+          executeStop,
+          { selector, container }
+        )
+      }
+
+      return executeStop()
     })
 
   /**
@@ -181,7 +236,7 @@ export function registerControlCommands(
     .command('docker.restart <selector> <container>', '重启容器')
     .alias('容器重启', '重启')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
-    .action(async ({ options }, selector, container) => {
+    .action(async ({ options, session }, selector, container) => {
       commandLogger.debug(`docker.restart 被调用: selector=${selector}, container=${container}`)
       const service = getService()
       if (!service) {
@@ -189,46 +244,73 @@ export function registerControlCommands(
         return 'Docker 服务未初始化'
       }
 
-      try {
-        if (container === '*') {
-          commandLogger.debug('批量重启容器')
-          // 批量操作
-          const results = await service.operateContainers(
+      // v0.1.0 权限检查
+      if (service.permissionManager) {
+        const permResult = await checkPermission(session, {
+          permissionManager: service.permissionManager,
+          resource: 'container',
+          action: 'restart'
+        })
+        if (!permResult.allowed) {
+          return `❌ ${permResult.error}`
+        }
+      }
+
+      // 审计日志包装
+      const executeRestart = async () => {
+        try {
+          if (container === '*') {
+            commandLogger.debug('批量重启容器')
+            const results = await service.operateContainers(
+              selector,
+              container,
+              'restart'
+            )
+
+            if (useImageOutput && ctx.puppeteer) {
+              const html = generateResultHtml(results, '批量重启结果')
+              return await renderToImage(ctx, html)
+            }
+
+            return formatSearchResults(results, '重启')
+          }
+
+          commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
+          const { node, container: found } = await service.findContainer(
             selector,
-            container,
-            'restart'
+            container
           )
+          commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
+
+          await node.restartContainer(found.Id)
+          commandLogger.debug(`容器已重启: ${found.Id}`)
 
           if (useImageOutput && ctx.puppeteer) {
-            const html = generateResultHtml(results, '批量重启结果')
+            const results = [{ node, container: found, success: true }]
+            const html = generateResultHtml(results, '重启成功')
             return await renderToImage(ctx, html)
           }
 
-          return formatSearchResults(results, '重启')
+          const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
+          return `✅ ${node.name}: ${name} 已重启`
+        } catch (e: any) {
+          commandLogger.error(`重启容器失败: ${e.message}`)
+          throw e
         }
-
-        commandLogger.debug(`查找容器: ${container} 在 ${selector}`)
-        const { node, container: found } = await service.findContainer(
-          selector,
-          container
-        )
-        commandLogger.debug(`找到容器: ${found.Names[0]} 在节点 ${node.name}`)
-
-        await node.restartContainer(found.Id)
-        commandLogger.debug(`容器已重启: ${found.Id}`)
-
-        if (useImageOutput && ctx.puppeteer) {
-          const results = [{ node, container: found, success: true }]
-          const html = generateResultHtml(results, '重启成功')
-          return await renderToImage(ctx, html)
-        }
-
-        const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
-        return `✅ ${node.name}: ${name} 已重启`
-      } catch (e: any) {
-        commandLogger.error(`重启容器失败: ${e.message}`)
-        return `❌ 重启失败: ${e.message}`
       }
+
+      // 使用审计日志包装
+      if (service.auditLogger) {
+        return withAuditLog(
+          service.auditLogger,
+          'container.restart',
+          session,
+          executeRestart,
+          { selector, container }
+        )
+      }
+
+      return executeRestart()
     })
 
   /**
@@ -307,7 +389,7 @@ export function registerControlCommands(
   ctx
     .command('docker.exec <selector> <container> <cmd>', '在容器内执行命令')
     .option('timeout', '-t <seconds> 超时时间(秒)', { fallback: 30 })
-    .action(async ({ options }, selector, container, cmd) => {
+    .action(async ({ options, session }, selector, container, cmd) => {
       const service = getService()
       if (!service) {
         return 'Docker 服务未初始化'
@@ -319,30 +401,58 @@ export function registerControlCommands(
 
       commandLogger.info(`[${selector}] 执行命令: "${cmd}"`)
 
-      try {
-        const { node, container: found } = await service.findContainer(
-          selector,
-          container
-        )
-
-        const result = await node.execContainer(found.Id, cmd)
-
-        const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
-
-        // 图片渲染模式
-        if (useImageOutput && ctx.puppeteer) {
-          const html = generateExecHtml(node.name, name, cmd, result.output, result.exitCode)
-          return await renderToImage(ctx, html)
+      // v0.1.0 权限检查
+      if (service.permissionManager) {
+        const permResult = await checkPermission(session, {
+          permissionManager: service.permissionManager,
+          resource: 'container',
+          action: 'exec'
+        })
+        if (!permResult.allowed) {
+          return `❌ ${permResult.error}`
         }
-
-        if (result.output.trim()) {
-          return `=== ${node.name}: ${name} ===\n${result.output}`
-        } else {
-          return `✅ ${node.name}: ${name} - 命令执行完成（无输出）`
-        }
-      } catch (e: any) {
-        commandLogger.error(`执行命令失败: ${e.message}`)
-        return `❌ 执行失败: ${e.message}`
       }
+
+      // 审计日志包装
+      const executeExec = async () => {
+        try {
+          const { node, container: found } = await service.findContainer(
+            selector,
+            container
+          )
+
+          const result = await node.execContainer(found.Id, cmd)
+
+          const name = found.Names[0]?.replace('/', '') || found.Id.slice(0, 8)
+
+          // 图片渲染模式
+          if (useImageOutput && ctx.puppeteer) {
+            const html = generateExecHtml(node.name, name, cmd, result.output, result.exitCode)
+            return await renderToImage(ctx, html)
+          }
+
+          if (result.output.trim()) {
+            return `=== ${node.name}: ${name} ===\n${result.output}`
+          } else {
+            return `✅ ${node.name}: ${name} - 命令执行完成（无输出）`
+          }
+        } catch (e: any) {
+          commandLogger.error(`执行命令失败: ${e.message}`)
+          throw e
+        }
+      }
+
+      // 使用审计日志包装
+      if (service.auditLogger) {
+        return withAuditLog(
+          service.auditLogger,
+          'container.exec',
+          session,
+          executeExec,
+          { selector, container, command: cmd }
+        )
+      }
+
+      return executeExec()
     })
 }

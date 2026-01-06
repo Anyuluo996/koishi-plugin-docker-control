@@ -140,6 +140,17 @@ export class DockerNode {
     this.dockerApiAvailable = false
 
     this.status = NodeStatus.DISCONNECTED
+
+    // 触发离线事件
+    this.emitEvent({
+      Type: 'node',
+      Action: 'offline',
+      Actor: { ID: this.config.id, Attributes: {} },
+      scope: 'local',
+      time: Date.now(),
+      timeNano: Date.now() * 1e6,
+    })
+
     nodeLogger.info(`[${this.name}] 已断开连接`)
   }
 

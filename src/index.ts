@@ -7,6 +7,14 @@ import { logger, nodeLogger, commandLogger } from './utils/logger'
 import { DockerService } from './service'
 import { MonitorManager } from './service/monitor'
 import { registerCommands } from './commands'
+import * as ConfigModule from './config'
+
+// v0.1.0 新增服务导入
+import { SSHConnectionPool } from './service/connection-pool'
+import { CacheManager } from './service/cache-manager'
+import { PermissionManager } from './service/permission-manager'
+import { AuditLogger } from './service/audit-logger'
+import { ReconnectManager } from './service/reconnect-manager'
 
 export const name = 'docker-control'
 
@@ -27,6 +35,35 @@ interface DockerControlSubscription {
   createdAt: number
 }
 
+// 用户权限记录
+interface UserPermissionRecord {
+  id: number
+  platform: string
+  userId: string
+  roles: string[]
+  nodePermissions: Record<string, string[]>
+  createdAt: number
+  updatedAt: number
+}
+
+// 审计日志记录
+interface AuditLogRecord {
+  id: number
+  timestamp: number
+  platform: string
+  userId: string
+  userName: string
+  channelId: string
+  action: string
+  parameters: Record<string, any>
+  result: string
+  errorMessage: string
+  duration: number
+  nodeId: string
+  containerId: string
+  metadata: Record<string, any>
+}
+
 // Puppeteer 类型扩展
 declare module 'koishi' {
   interface Context {
@@ -40,39 +77,12 @@ declare module 'koishi' {
 
   interface Tables {
     'docker_control_subscriptions': DockerControlSubscription
+    'docker_user_permissions': UserPermissionRecord
+    'docker_audit_logs': AuditLogRecord
   }
 }
 
-// 导出配置 Schema
-export const Config = Schema.object({
-  requestTimeout: Schema.number().default(30000).description('请求超时 (毫秒)'),
-  debug: Schema.boolean().default(false).description('调试模式'),
-  imageOutput: Schema.boolean().default(false).description('使用图片格式输出容器列表和操作结果'),
-  defaultLogLines: Schema.number().default(100).description('默认日志显示的行数'),
-  // 监控策略
-  monitor: Schema.object({
-    debounceWait: Schema.number().default(60000).description('容器意外停止后等待重启的时间 (ms)，在此期间恢复不发送通知'),
-    flappingWindow: Schema.number().default(300000).description('检测抖动/频繁重启的时间窗口 (ms)'),
-    flappingThreshold: Schema.number().default(3).description('时间窗口内允许的最大状态变更次数，超过则报警'),
-  }).description('监控策略设置'),
-  credentials: Schema.array(Schema.object({
-    id: Schema.string().required(),
-    name: Schema.string().required(),
-    username: Schema.string().default('root'),
-    authType: Schema.union(['key', 'password'] as const).default('key'),
-    password: Schema.string().role('secret'),
-    privateKey: Schema.string().role('textarea'),
-    passphrase: Schema.string().role('secret'),
-  })).description('SSH 凭证列表'),
-  nodes: Schema.array(Schema.object({
-    id: Schema.string().required(),
-    name: Schema.string().required(),
-    tags: Schema.array(Schema.string()).default([]),
-    host: Schema.string().required().description('SSH 主机地址'),
-    port: Schema.number().default(22).description('SSH 端口'),
-    credentialId: Schema.string().required().description('SSH 凭证 ID'),
-  })).description('Docker 节点列表'),
-})
+export const Config = ConfigModule.ConfigSchema
 
 // 事件消息模板
 const EVENT_MESSAGES: Record<string, string> = {
@@ -135,8 +145,81 @@ export function apply(ctx: Context, config: DockerControlConfig) {
 
   // 创建服务实例
   const dockerService = new DockerService(ctx, config)
+
   // 传入监控配置
   const monitorManager = new MonitorManager(config.monitor || {})
+
+  // ==================== v0.1.0 新增服务初始化 ====================
+  let connectionPool: SSHConnectionPool | null = null
+  let cacheManager: CacheManager | null = null
+  let permissionManager: PermissionManager | null = null
+  let auditLogger: AuditLogger | null = null
+  let reconnectManager: ReconnectManager | null = null
+
+  // 初始化连接池
+  if (config.connectionPool?.enabled !== false) {
+    const poolConfig = config.connectionPool || {
+      enabled: true,
+      maxConnectionsPerNode: 5,
+      minConnectionsPerNode: 1,
+      connectionTimeout: 30000,
+      idleTimeout: 300000,
+      healthCheckInterval: 60000,
+    }
+    connectionPool = new SSHConnectionPool(poolConfig)
+    logger.info('✅ SSH 连接池已启用')
+  } else {
+    logger.info('⚪ SSH 连接池已禁用')
+  }
+
+  // 初始化缓存管理器
+  if (config.cache?.enabled !== false) {
+    const cacheConfig = config.cache || { enabled: true }
+    cacheManager = new CacheManager(cacheConfig)
+    logger.info('✅ 缓存管理器已启用')
+  } else {
+    logger.info('⚪ 缓存管理器已禁用')
+  }
+
+  // 初始化权限管理器
+  if (config.permissions?.enabled === true) {
+    const permConfig = config.permissions
+    permissionManager = new PermissionManager(ctx, permConfig)
+    dockerService.permissionManager = permissionManager
+    logger.info('✅ 权限管理器已启用')
+  } else {
+    logger.info('⚪ 权限管理器已禁用')
+  }
+
+  // 初始化审计日志
+  if (config.audit?.enabled !== false) {
+    const auditConfig: any = config.audit || {
+      enabled: true,
+      retentionDays: 90,
+      sensitiveFields: ['password', 'privateKey', 'passphrase']
+    }
+    auditLogger = new AuditLogger(ctx, auditConfig)
+    dockerService.auditLogger = auditLogger
+    logger.info('✅ 审计日志已启用')
+  } else {
+    logger.info('⚪ 审计日志已禁用')
+  }
+
+  // 初始化重连管理器
+  if (config.reconnect?.enabled !== false) {
+    const reconnectConfig = config.reconnect || {
+      enabled: true,
+      maxAttempts: 10,
+      initialDelay: 1000,
+      maxDelay: 60000,
+      heartbeatInterval: 30000,
+    }
+    reconnectManager = new ReconnectManager(reconnectConfig)
+    dockerService.reconnectManager = reconnectManager
+    logger.info('✅ 自动重连已启用')
+  } else {
+    logger.info('⚪ 自动重连已禁用')
+  }
 
   // 插件就绪时初始化（异步，不阻塞 Koishi 启动）
   setTimeout(() => {
@@ -147,6 +230,133 @@ export function apply(ctx: Context, config: DockerControlConfig) {
 
   // 注册基础指令
   registerCommands(ctx, () => dockerService, config)
+
+  // ==================== v0.1.0 系统监控指令 ====================
+
+  /**
+   * 查看系统状态
+   */
+  ctx.command('docker.system', '查看系统状态（v0.1.0 新增功能）')
+    .alias('系统状态', 'docker系统')
+    .action(async () => {
+      const lines: string[] = []
+      lines.push('=== Docker Control v0.1.0 系统状态 ===\n')
+
+      // 连接池状态
+      if (connectionPool) {
+        const stats = connectionPool.getStats()
+        lines.push('📦 SSH 连接池:')
+        lines.push(`  状态: ✅ 已启用`)
+        lines.push(`  总连接数: ${stats.totalConnections}`)
+        lines.push(`  活跃连接: ${stats.activeConnections}`)
+        lines.push(`  空闲连接: ${stats.idleConnections}`)
+        lines.push('')
+      } else {
+        lines.push('📦 SSH 连接池: ⚪ 未启用\n')
+      }
+
+      // 缓存状态
+      if (cacheManager) {
+        const stats = cacheManager.getStats()
+        lines.push('⚡ 缓存管理器:')
+        lines.push(`  状态: ✅ 已启用`)
+        lines.push(`  缓存条目: ${stats.size}`)
+        lines.push(`  命中率: ${(stats.hitRate * 100).toFixed(2)}%`)
+        lines.push('')
+      } else {
+        lines.push('⚡ 缓存管理器: ⚪ 未启用\n')
+      }
+
+      // 权限管理状态
+      if (permissionManager) {
+        lines.push('🔐 权限管理: ✅ 已启用\n')
+      } else {
+        lines.push('🔐 权限管理: ⚪ 未启用\n')
+      }
+
+      // 审计日志状态
+      if (auditLogger) {
+        lines.push('📊 审计日志: ✅ 已启用\n')
+      } else {
+        lines.push('📊 审计日志: ⚪ 未启用\n')
+      }
+
+      // 重连管理状态
+      if (reconnectManager) {
+        lines.push('🔄 自动重连: ✅ 已启用\n')
+      } else {
+        lines.push('🔄 自动重连: ⚪ 未启用\n')
+      }
+
+      lines.push('提示: 使用 docker.system.pool / docker.system.cache 查看详情')
+
+      return lines.join('\n')
+    })
+
+  /**
+   * 查看连接池状态
+   */
+  ctx.command('docker.system.pool', '查看连接池详细状态')
+    .alias('连接池状态')
+    .action(async () => {
+      if (!connectionPool) {
+        return '❌ 连接池未启用'
+      }
+
+      const stats = connectionPool.getStats()
+      const lines: string[] = []
+      lines.push('=== SSH 连接池详情 ===\n')
+      lines.push(`总连接数: ${stats.totalConnections}`)
+      lines.push(`活跃连接: ${stats.activeConnections}`)
+      lines.push(`空闲连接: ${stats.idleConnections}`)
+      lines.push(`每节点最大连接数: ${stats.maxConnectionsPerNode || 5}`)
+      lines.push(`空闲超时: ${stats.idleTimeout || 300000}ms`)
+
+      if (stats.connections && Object.keys(stats.connections).length > 0) {
+        lines.push('\n各节点连接数:')
+        for (const [nodeId, count] of Object.entries(stats.connections)) {
+          lines.push(`  ${nodeId}: ${count} 个连接`)
+        }
+      }
+
+      return lines.join('\n')
+    })
+
+  /**
+   * 查看缓存状态
+   */
+  ctx.command('docker.system.cache', '查看缓存详细状态')
+    .alias('缓存状态')
+    .action(async () => {
+      if (!cacheManager) {
+        return '❌ 缓存未启用'
+      }
+
+      const stats = cacheManager.getStats()
+      const lines: string[] = []
+      lines.push('=== 缓存管理器详情 ===\n')
+      lines.push(`缓存条目: ${stats.size}`)
+      lines.push(`命中率: ${(stats.hitRate * 100).toFixed(2)}%`)
+      lines.push(`命中次数: ${stats.hitCount}`)
+      lines.push(`未命中次数: ${stats.missCount}`)
+      lines.push(`总查询: ${stats.hitCount + stats.missCount}`)
+
+      return lines.join('\n')
+    })
+
+  /**
+   * 清空缓存
+   */
+  ctx.command('docker.system.cache clear', '清空缓存')
+    .alias('清空缓存')
+    .action(async () => {
+      if (!cacheManager) {
+        return '❌ 缓存未启用'
+      }
+
+      cacheManager.clear()
+      return '✅ 缓存已清空'
+    })
 
   // ==================== 订阅指令 ====================
   ctx.command('docker.subscribe <node> <container>', '订阅容器状态变更通知')

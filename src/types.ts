@@ -69,6 +69,44 @@ export interface DockerControlConfig {
   credentials: CredentialConfig[]
   nodes: NodeConfig[]
   notification: NotificationConfig
+
+  // 增强功能配置
+  connectionPool?: {
+    enabled: boolean
+    maxConnectionsPerNode: number
+    minConnectionsPerNode: number
+    connectionTimeout: number
+    idleTimeout: number
+    healthCheckInterval: number
+  }
+  cache?: {
+    enabled: boolean
+    defaultTTL: number
+    cleanupInterval: number
+    maxCacheSize: number
+  }
+  permissions?: {
+    enabled: boolean
+    defaultRole: 'viewer' | 'operator' | 'admin'
+    adminUsers: string[]
+  }
+  audit?: {
+    enabled: boolean
+    retentionDays: number
+    sensitiveFields: string[]
+  }
+  reconnect?: {
+    enabled: boolean
+    maxAttempts: number
+    initialDelay: number
+    maxDelay: number
+    heartbeatInterval: number
+  }
+  retry?: {
+    maxAttempts: number
+    initialDelay: number
+    maxDelay: number
+  }
 }
 
 // ==================== Docker 类型 ====================

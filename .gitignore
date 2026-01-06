@@ -1,6 +1,7 @@
 # 构建输出
 lib
 dist
+docs
 
 # 依赖
 node_modules
@@ -24,6 +25,7 @@ tsconfig.tsbuildinfo
 *.ntvs*
 *.njsproj
 *.sln
+*.md
 
 # 临时文件
 *.tmp
