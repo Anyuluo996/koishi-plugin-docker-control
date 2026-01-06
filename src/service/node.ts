@@ -734,6 +734,168 @@ export class DockerNode {
   }
 
   /**
+   * 检查是否在 Swarm 模式
+   */
+  async isSwarmMode(): Promise<boolean> {
+    if (!this.dockerode || !this.dockerApiAvailable) return false
+
+    try {
+      const info = await this.dockerode.info()
+      return info.Swarm?.LocalNodeState === 'active'
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 获取 Swarm 集群信息
+   */
+  async getSwarmInfo(): Promise<{ id: string; name: string; createdAt: string; updatedAt: string } | null> {
+    if (!this.dockerode || !this.dockerApiAvailable) return null
+
+    try {
+      // 使用 dockerode 的 getSwarm 方法
+      const swarmInfo = await this.dockerode.swarmInspect()
+      return {
+        id: swarmInfo.ID?.slice(0, 12) || '-',
+        name: swarmInfo.Name || '-',
+        createdAt: swarmInfo.CreatedAt ? new Date(swarmInfo.CreatedAt).toLocaleString() : '-',
+        updatedAt: swarmInfo.UpdatedAt ? new Date(swarmInfo.UpdatedAt).toLocaleString() : '-'
+      }
+    } catch (e: any) {
+      nodeLogger.debug(`[${this.name}] 获取 Swarm 信息失败: ${e.message}`)
+      return null
+    }
+  }
+
+  /**
+   * 获取 Swarm 节点列表
+   */
+  async getSwarmNodes(): Promise<Array<{
+    ID: string
+    Hostname: string
+    Status: { State: string; Addr: string }
+    Availability: string
+    Role: string
+    ManagerStatus?: { Leader: boolean; Reachability: string } | null
+  }>> {
+    if (!this.dockerode || !this.dockerApiAvailable) return []
+
+    try {
+      const nodes = await this.dockerode.listNodes()
+      return nodes.map(node => ({
+        ID: node.ID || '',
+        Hostname: node.Description?.Hostname || node.ID?.slice(0, 12) || '-',
+        Status: {
+          State: node.Status?.State || '-',
+          Addr: node.Status?.Addr || '-'
+        },
+        Availability: node.Spec?.Availability || '-',
+        Role: node.Spec?.Role || '-',
+        ManagerStatus: node.ManagerStatus || null
+      }))
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 获取 Swarm 节点列表失败: ${e.message}`)
+      return []
+    }
+  }
+
+  /**
+   * 获取 Swarm 服务列表
+   */
+  async getSwarmServices(): Promise<Array<{
+    ID: string
+    Name: string
+    Replicas: string
+    Image: string
+    Ports: string
+  }>> {
+    if (!this.dockerode || !this.dockerApiAvailable) return []
+
+    try {
+      const services = await this.dockerode.listServices()
+      return services.map(service => {
+        const spec: any = service.Spec || {}
+        const taskTemplate: any = spec.TaskTemplate || {}
+        const containerSpec: any = taskTemplate.ContainerSpec || {}
+
+        // 尝试从多个位置获取镜像名称
+        let image = containerSpec.Image || '-'
+        if (image === '-' && spec.TaskSpec) {
+          const taskSpec: any = spec.TaskSpec
+          if (taskSpec.ContainerSpec) {
+            image = taskSpec.ContainerSpec.Image || '-'
+          }
+        }
+
+        // 解析副本数
+        const mode: any = spec.Mode || {}
+        const replicated = mode.Replicated
+        const global = mode.Global
+        let replicas = '-'
+        if (replicated) {
+          replicas = replicated.Replicas !== undefined ? String(replicated.Replicas) : '-'
+        } else if (global) {
+          replicas = 'global'
+        }
+
+        // 解析端口
+        const endpointSpec: any = spec.EndpointSpec || {}
+        const ports: any[] = endpointSpec.Ports || []
+        const portStr = ports.length > 0
+          ? ports.map((p: any) => `${p.PublishedPort}:${p.TargetPort}/${p.Protocol || 'tcp'}`).join(', ')
+          : '-'
+
+        return {
+          ID: service.ID || '',
+          Name: spec.Name || '-',
+          Replicas: replicas,
+          Image: image,
+          Ports: portStr
+        }
+      })
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 获取 Swarm 服务列表失败: ${e.message}`)
+      return []
+    }
+  }
+
+  /**
+   * 获取 Swarm 服务任务列表
+   */
+  async getSwarmTasks(serviceIdOrName?: string): Promise<Array<{
+    ID: string
+    Slot: string
+    Status: { State: string; Since: string }
+    DesiredState: string
+    NodeID: string
+  }>> {
+    if (!this.dockerode || !this.dockerApiAvailable) return []
+
+    try {
+      const filters: any = {}
+      if (serviceIdOrName) {
+        filters.service = [serviceIdOrName]
+      }
+
+      const tasks = await this.dockerode.listTasks({ filters })
+      return tasks.map(task => ({
+        ID: task.ID || '',
+        Slot: task.Slot !== undefined ? String(task.Slot) : '-',
+        Status: {
+          State: task.Status?.State || '-',
+          Since: task.Status?.Timestamp ? new Date(task.Status.Timestamp).toLocaleString() : '-'
+        },
+        DesiredState: task.DesiredState || '-',
+        NodeID: task.NodeID?.slice(0, 12) || '-'
+      }))
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 获取 Swarm 任务列表失败: ${e.message}`)
+      return []
+    }
+  }
+
+  /**
    * 初始化 Dockerode
    * 根据配置决定连接本地 Socket 还是通过 SSH 连接远程
    */

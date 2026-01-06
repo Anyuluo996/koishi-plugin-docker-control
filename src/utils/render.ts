@@ -1224,3 +1224,317 @@ export function generateVolumesHtml(
 
   return wrapHtml(header + '<div class="content">' + content + '</div>')
 }
+
+/**
+ * 生成集群信息 HTML
+ */
+export function generateSwarmInfoHtml(
+  nodeName: string,
+  swarmInfo: { id: string; name: string; createdAt: string; updatedAt: string }
+): string {
+  const header = `
+    <div class="header">
+      <div class="header-title">🐋 Swarm 集群</div>
+      <div class="header-badge">${nodeName}</div>
+    </div>
+  `
+
+  const body = `
+    <div class="content">
+      <div class="detail-card">
+        <div class="detail-grid">
+          <div class="detail-item">
+            <div class="detail-label">集群 ID</div>
+            <div class="detail-value highlight">${swarmInfo.id}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">集群名称</div>
+            <div class="detail-value">${swarmInfo.name}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">创建时间</div>
+            <div class="detail-value">${swarmInfo.createdAt}</div>
+          </div>
+          <div class="detail-item">
+            <div class="detail-label">更新时间</div>
+            <div class="detail-value">${swarmInfo.updatedAt}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `
+
+  return wrapHtml(header + body)
+}
+
+/**
+ * 生成集群节点列表 HTML
+ */
+export function generateSwarmNodesHtml(
+  data: Array<{ node: any; swarmNodes: Array<{
+    ID: string
+    Hostname: string
+    Status: { State: string; Addr: string }
+    Availability: string
+    Role: string
+    ManagerStatus?: { Leader: boolean; Reachability: string } | null
+  }> }>,
+  title: string = '集群节点'
+): string {
+  let stats = { total: 0, managers: 0, workers: 0, ready: 0 }
+
+  const content = data.map(({ node, swarmNodes }) => {
+    const nodeStats = {
+      total: swarmNodes.length,
+      managers: swarmNodes.filter(n => n.Role === 'Manager').length,
+      workers: swarmNodes.filter(n => n.Role === 'Worker').length,
+      ready: swarmNodes.filter(n => n.Status.State === 'ready').length
+    }
+    stats.total += nodeStats.total
+    stats.managers += nodeStats.managers
+    stats.workers += nodeStats.workers
+    stats.ready += nodeStats.ready
+
+    const listItems = swarmNodes.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无节点)</div>`
+      : swarmNodes.map(n => {
+        const shortId = n.ID.slice(0, 12)
+        const isLeader = n.ManagerStatus?.Leader
+        const icon = isLeader ? '👑' : n.Role === 'Manager' ? '🎛️' : '👷'
+        const statusIcon = n.Status.State === 'ready' ? '🟢' : '🔴'
+
+        // 可用性状态颜色
+        const availabilityColor = n.Availability === 'active' ? '#4ade80' :
+                                  n.Availability === 'pause' ? '#facc15' : '#94a3b8'
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${icon}</div>
+            <div class="name-col">
+              <div>${n.Hostname}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${n.Status.Addr}</div>
+            </div>
+            <div class="meta-col">
+              <div>ID: ${shortId}</div>
+              <div style="color: #64748b; margin-top:2px;">
+                ${statusIcon} ${n.Status.State}
+                ${n.ManagerStatus?.Reachability ? ` | ${n.ManagerStatus.Reachability}` : ''}
+              </div>
+            </div>
+            <div style="text-align: right;">
+              <div class="tag" style="background: rgba(96, 165, 250, 0.1); color: #60a5fa">${n.Role}</div>
+              <div class="tag" style="background: rgba(${availabilityColor}, 0.1); color: ${availabilityColor}; margin-top: 4px;">${n.Availability}</div>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>🐋 ${node.name}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.managers}M/${nodeStats.workers}W | ${nodeStats.ready} Ready</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} | ${stats.managers}M/${stats.workers}W | ${stats.ready} Ready</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}
+
+/**
+ * 生成集群服务列表 HTML
+ */
+export function generateSwarmServicesHtml(
+  data: Array<{ node: any; services: Array<{
+    ID: string
+    Name: string
+    Replicas: string
+    Image: string
+    Ports: string
+  }> }>,
+  title: string = '集群服务'
+): string {
+  let stats = { total: 0, replicas: 0 }
+
+  const content = data.map(({ node, services }) => {
+    const nodeStats = {
+      total: services.length,
+      replicas: 0
+    }
+
+    // 计算副本总数
+    services.forEach(s => {
+      if (s.Replicas !== 'global' && s.Replicas !== '-') {
+        const parts = s.Replicas.split('/')
+        const running = parseInt(parts[1]) || 0
+        nodeStats.replicas += running
+      }
+    })
+
+    stats.total += nodeStats.total
+    stats.replicas += nodeStats.replicas
+
+    const listItems = services.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无服务)</div>`
+      : services.map(s => {
+        const shortId = s.ID.slice(0, 12)
+        const icon = '🔧'
+        const imageName = s.Image.split('@')[0] // 移除 digest 部分
+
+        // 解析副本状态
+        let replicaStatus = '-'
+        let replicaColor = '#94a3b8'
+        if (s.Replicas !== 'global' && s.Replicas !== '-') {
+          const parts = s.Replicas.split('/')
+          const running = parseInt(parts[0]) || 0
+          const total = parseInt(parts[1]) || 0
+          if (running === total) {
+            replicaColor = '#4ade80'
+          } else if (running > 0) {
+            replicaColor = '#facc15'
+          } else {
+            replicaColor = '#f87171'
+          }
+          replicaStatus = `${running}/${total}`
+        } else if (s.Replicas === 'global') {
+          replicaColor = '#60a5fa'
+          replicaStatus = 'global'
+        }
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${icon}</div>
+            <div class="name-col">
+              <div>${s.Name}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${imageName}</div>
+            </div>
+            <div class="meta-col">
+              <div>ID: ${shortId}</div>
+              <div style="color: #64748b; margin-top:2px;">${s.Ports !== '-' ? s.Ports : '无端口映射'}</div>
+            </div>
+            <div style="text-align: right;">
+              <span class="tag" style="background: rgba(${replicaColor}, 0.1); color: ${replicaColor}">${replicaStatus}</span>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>🐋 ${node.name}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.total} 个服务 | ${nodeStats.replicas} 个副本</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} services | ${stats.replicas} replicas</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}
+
+/**
+ * 生成集群任务列表 HTML
+ */
+export function generateSwarmTasksHtml(
+  data: Array<{ node: any; serviceName: string; tasks: Array<{
+    ID: string
+    Slot: string
+    Status: { State: string; Since: string }
+    DesiredState: string
+    NodeID: string
+  }> }>,
+  title: string
+): string {
+  let stats = { total: 0, running: 0, failed: 0 }
+
+  const content = data.map(({ node, serviceName, tasks }) => {
+    const nodeStats = {
+      total: tasks.length,
+      running: 0,
+      failed: 0
+    }
+
+    tasks.forEach(t => {
+      if (t.Status.State === 'running') nodeStats.running++
+      if (t.Status.State === 'failed') nodeStats.failed++
+    })
+
+    stats.total += nodeStats.total
+    stats.running += nodeStats.running
+    stats.failed += nodeStats.failed
+
+    const listItems = tasks.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无任务)</div>`
+      : tasks.map(t => {
+        const shortId = t.ID.slice(0, 12)
+        const statusIcon = t.Status.State === 'running' ? '🟢' :
+                          t.Status.State === 'pending' ? '⏳' :
+                          t.Status.State === 'failed' ? '❌' :
+                          t.Status.State === 'complete' ? '✅' : '⚪'
+
+        const statusColor = t.Status.State === 'running' ? '#4ade80' :
+                           t.Status.State === 'pending' ? '#facc15' :
+                           t.Status.State === 'failed' ? '#f87171' :
+                           t.Status.State === 'complete' ? '#60a5fa' : '#94a3b8'
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${statusIcon}</div>
+            <div class="name-col">
+              <div>Slot ${t.Slot}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${t.Status.Since}</div>
+            </div>
+            <div class="meta-col">
+              <div>ID: ${shortId}</div>
+              <div style="color: #64748b; margin-top:2px;">Node: ${t.NodeID}</div>
+            </div>
+            <div style="text-align: right;">
+              <span class="tag" style="background: rgba(${statusColor}, 0.1); color: ${statusColor}">${t.Status.State}</span>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>🐋 ${node.name} - ${serviceName}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.running}/${nodeStats.total} Running</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} | ${stats.running} Running | ${stats.failed} Failed</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}

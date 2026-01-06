@@ -9,6 +9,7 @@ import { registerLogsCommand } from './logs'
 import { registerComposeCommand } from './compose'
 import { registerResourceCommands } from './resources'
 import { registerUpdateCommands } from './update'
+import { registerClusterCommands } from './cluster'
 import { generateNodesHtml, generateNodeDetailHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
@@ -31,6 +32,7 @@ export function registerCommands(
   registerComposeCommand(ctx, getService, config)
   registerResourceCommands(ctx, getService, config)
   registerUpdateCommands(ctx, getService)
+  registerClusterCommands(ctx, getService, config)
 
   // 注册辅助指令
   registerHelperCommands(ctx, getService, config)
@@ -255,6 +257,12 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.update <节点> <容器> [-b] - 更新容器 (-b 备份)',
       '  docker.backup <节点> <容器> [tag] - 备份容器为镜像',
       '  docker.set <节点> <容器> -e KEY=VALUE - 修改环境变量',
+      '',
+      '【集群操作】',
+      '  docker.cluster [节点]      - 查看 Swarm 集群信息',
+      '  docker.cluster.nodes [节点] - 查看集群节点 [-f image]',
+      '  docker.cluster.services [节点] - 查看集群服务 [-f image]',
+      '  docker.cluster.ps <节点> <服务> - 查看服务任务 [-f image]',
       '',
       '【资源操作】',
       '  docker.images <节点>       - 查看镜像列表 [-f image]',
