@@ -235,6 +235,168 @@ export class DockerNode {
   }
 
   /**
+   * 获取镜像列表
+   */
+  async listImages(): Promise<Array<{
+    Id: string
+    Repository: string
+    Tag: string
+    Size: string
+    Created: string
+  }>> {
+    if (!this.connector || this.status !== NodeStatus.CONNECTED) {
+      throw new Error(`节点 ${this.name} 未连接`)
+    }
+
+    // 使用 JSON 格式输出，便于解析
+    const output = await this.connector.exec(
+      'docker images --format "{{.ID}}|{{.Repository}}|{{.Tag}}|{{.Size}}|{{.CreatedAt}}"'
+    )
+
+    if (!output.trim()) return []
+
+    return output.split('\n').filter(Boolean).map(line => {
+      const parts = line.split('|')
+      return {
+        Id: parts[0] || '',
+        Repository: parts[1] || '<none>',
+        Tag: parts[2] || '<none>',
+        Size: parts[3] || '-',
+        Created: parts[4] || '-',
+      }
+    })
+  }
+
+  /**
+   * 获取网络列表
+   */
+  async listNetworks(): Promise<Array<{
+    Id: string
+    Name: string
+    Driver: string
+    Scope: string
+    Subnet: string
+    Gateway: string
+  }>> {
+    if (!this.connector || this.status !== NodeStatus.CONNECTED) {
+      throw new Error(`节点 ${this.name} 未连接`)
+    }
+
+    const output = await this.connector.exec(
+      'docker network ls --format "{{.ID}}|{{.Name}}|{{.Driver}}|{{.Scope}}"'
+    )
+
+    if (!output.trim()) return []
+
+    const networks: Array<{
+      Id: string
+      Name: string
+      Driver: string
+      Scope: string
+      Subnet: string
+      Gateway: string
+    }> = []
+
+    for (const line of output.split('\n').filter(Boolean)) {
+      const parts = line.split('|')
+      const networkId = parts[0] || ''
+
+      // 获取网络的详细信息（子网和网关）
+      let subnet = '-'
+      let gateway = '-'
+      try {
+        const inspectOutput = await this.connector.exec(
+          `docker network inspect ${networkId} --format "{{range .IPAM.Config}}{{.Subnet}},{{.Gateway}}{{end}}"`
+        )
+        if (inspectOutput.trim()) {
+          const configParts = inspectOutput.trim().split(',')
+          subnet = configParts[0] || '-'
+          gateway = configParts[1] || '-'
+        }
+      } catch {
+        // 忽略 inspect 失败
+      }
+
+      networks.push({
+        Id: networkId,
+        Name: parts[1] || '',
+        Driver: parts[2] || '-',
+        Scope: parts[3] || '-',
+        Subnet: subnet,
+        Gateway: gateway,
+      })
+    }
+
+    return networks
+  }
+
+  /**
+   * 获取存储卷列表
+   */
+  async listVolumes(): Promise<Array<{
+    Name: string
+    Driver: string
+    Scope: string
+    Mountpoint: string
+    Size: string
+  }>> {
+    if (!this.connector || this.status !== NodeStatus.CONNECTED) {
+      throw new Error(`节点 ${this.name} 未连接`)
+    }
+
+    const output = await this.connector.exec(
+      'docker volume ls --format "{{.Name}}|{{.Driver}}|{{.Scope}}"'
+    )
+
+    if (!output.trim()) return []
+
+    const volumes: Array<{
+      Name: string
+      Driver: string
+      Scope: string
+      Mountpoint: string
+      Size: string
+    }> = []
+
+    for (const line of output.split('\n').filter(Boolean)) {
+      const parts = line.split('|')
+      const volumeName = parts[0] || ''
+
+      // 获取卷的详细信息（挂载点）
+      let mountpoint = '-'
+      try {
+        const inspectOutput = await this.connector.exec(
+          `docker volume inspect ${volumeName} --format "{{.Mountpoint}}"`
+        )
+        mountpoint = inspectOutput.trim() || '-'
+      } catch {
+        // 忽略 inspect 失败
+      }
+
+      // 尝试获取卷的大小（通过 du 命令）
+      let size = '-'
+      if (mountpoint !== '-') {
+        try {
+          const sizeOutput = await this.connector.exec(`du -sh ${mountpoint} 2>/dev/null | cut -f1`)
+          size = sizeOutput.trim() || '-'
+        } catch {
+          // 忽略 du 命令失败
+        }
+      }
+
+      volumes.push({
+        Name: volumeName,
+        Driver: parts[1] || 'local',
+        Scope: parts[2] || 'local',
+        Mountpoint: mountpoint,
+        Size: size,
+      })
+    }
+
+    return volumes
+  }
+
+  /**
    * 获取容器的 Docker Compose 信息
    * 通过标签 com.docker.compose.project.config_files 获取 compose 文件路径
    */

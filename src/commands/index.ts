@@ -7,6 +7,7 @@ import { registerListCommand } from './list'
 import { registerControlCommands } from './control'
 import { registerLogsCommand } from './logs'
 import { registerComposeCommand } from './compose'
+import { registerResourceCommands } from './resources'
 import { generateNodesHtml, generateNodeDetailHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
@@ -27,6 +28,7 @@ export function registerCommands(
   registerControlCommands(ctx, getService, config)
   registerLogsCommand(ctx, getService, config)
   registerComposeCommand(ctx, getService, config)
+  registerResourceCommands(ctx, getService, config)
 
   // 注册辅助指令
   registerHelperCommands(ctx, getService, config)
@@ -237,8 +239,8 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.nodes               - 查看节点列表',
       '  docker.node <节点>         - 查看节点详情',
       '',
-      '【容器操作】(参数顺序: 节点 容器)',
-      '  docker.ls <节点>           - 列出容器',
+      '【容器操作】',
+      '  docker.ls <节点>           - 列出容器 [-f image]',
       '  docker.start <节点> <容器> - 启动容器',
       '  docker.stop <节点> <容器>  - 停止容器',
       '  docker.restart <节点> <容器> - 重启容器',
@@ -246,10 +248,19 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.inspect <节点> <容器> - 查看容器详情',
       '  docker.exec <节点> <容器> <命令> - 在容器内执行命令',
       '',
+      '【资源操作】',
+      '  docker.images <节点>       - 查看镜像列表 [-f image]',
+      '  docker.networks <节点>     - 查看网络列表 [-f image]',
+      '  docker.volumes <节点>      - 查看存储卷列表 [-f image]',
+      '',
       '【节点选择器】',
       '  all        - 所有节点',
       '  @标签      - 指定标签的节点',
       '  节点ID/名称 - 指定单个节点',
+      '',
+      '【输出格式】',
+      '  -f simple   - 文本格式（默认）',
+      '  -f image    - 图片格式（需要 puppeteer 插件）',
       '',
       '【通知事件类型】',
       '  container.start/stop/restart/die',

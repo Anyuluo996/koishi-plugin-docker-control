@@ -1037,3 +1037,190 @@ function highlightYaml(content: string): string {
 
   return html
 }
+
+/**
+ * 生成镜像列表 HTML
+ */
+export function generateImagesHtml(
+  data: Array<{ node: any; images: Array<{ Id: string; Repository: string; Tag: string; Size: string; Created: string }> }>,
+  title: string = '镜像列表'
+): string {
+  let stats = { total: 0, totalSize: 0 }
+
+  const content = data.map(({ node, images }) => {
+    const nodeStats = {
+      total: images.length
+    }
+    stats.total += nodeStats.total
+
+    const listItems = images.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无镜像)</div>`
+      : images.map(img => {
+        const shortId = img.Id.slice(0, 12)
+        const isNone = img.Repository === '<none>' || img.Tag === '<none>'
+        const icon = isNone ? '📦' : '🐳'
+        const fullName = `${img.Repository}:${img.Tag}`
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${icon}</div>
+            <div class="name-col">
+              <div>${fullName}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${img.Created}</div>
+            </div>
+            <div class="meta-col">
+              <div>ID: ${shortId}</div>
+              <div style="color: #64748b; margin-top:2px;">${img.Size}</div>
+            </div>
+            <div style="text-align: right;">
+              <span class="tag" style="background: ${isNone ? 'rgba(100, 116, 139, 0.1); color: #94a3b8' : 'rgba(96, 165, 250, 0.1); color: #60a5fa'}">${isNone ? 'dangling' : 'ok'}</span>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>📦 ${node.name}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.total} 个镜像</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} images</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}
+
+/**
+ * 生成网络列表 HTML
+ */
+export function generateNetworksHtml(
+  data: Array<{ node: any; networks: Array<{ Id: string; Name: string; Driver: string; Scope: string; Subnet: string; Gateway: string }> }>,
+  title: string = '网络列表'
+): string {
+  let stats = { total: 0 }
+
+  const content = data.map(({ node, networks }) => {
+    const nodeStats = {
+      total: networks.length
+    }
+    stats.total += nodeStats.total
+
+    const listItems = networks.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无网络)</div>`
+      : networks.map(net => {
+        const shortId = net.Id.slice(0, 12)
+        const icon = net.Driver === 'bridge' ? '🌉' : net.Driver === 'overlay' ? '🔗' : net.Driver === 'host' ? '🏠' : net.Driver === 'none' ? '🚫' : '🌐'
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${icon}</div>
+            <div class="name-col">
+              <div>${net.Name}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${net.Subnet !== '-' ? `子网: ${net.Subnet}` : net.Scope}</div>
+            </div>
+            <div class="meta-col">
+              <div>ID: ${shortId}</div>
+              <div style="color: #64748b; margin-top:2px;">${net.Gateway !== '-' ? `网关: ${net.Gateway}` : net.Driver}</div>
+            </div>
+            <div style="text-align: right;">
+              <span class="tag" style="background: rgba(167, 139, 250, 0.1); color: #a78bfa">${net.Driver}</span>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>🌐 ${node.name}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.total} 个网络</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} networks</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}
+
+/**
+ * 生成存储卷列表 HTML
+ */
+export function generateVolumesHtml(
+  data: Array<{ node: any; volumes: Array<{ Name: string; Driver: string; Scope: string; Mountpoint: string; Size: string }> }>,
+  title: string = '存储卷列表'
+): string {
+  let stats = { total: 0 }
+
+  const content = data.map(({ node, volumes }) => {
+    const nodeStats = {
+      total: volumes.length
+    }
+    stats.total += nodeStats.total
+
+    const listItems = volumes.length === 0
+      ? `<div style="padding: 20px; text-align: center; color: #64748b;">(暂无存储卷)</div>`
+      : volumes.map(vol => {
+        const icon = vol.Driver === 'local' ? '💾' : '📀'
+
+        return `
+          <div class="list-item">
+            <div class="status-icon">${icon}</div>
+            <div class="name-col">
+              <div>${vol.Name}</div>
+              <div style="font-size:12px; opacity:0.6; margin-top:2px;">${vol.Mountpoint !== '-' ? vol.Mountpoint.slice(0, 40) + (vol.Mountpoint.length > 40 ? '...' : '') : vol.Scope}</div>
+            </div>
+            <div class="meta-col">
+              <div>${vol.Driver}</div>
+              <div style="color: #64748b; margin-top:2px;">${vol.Size !== '-' ? vol.Size : vol.Scope}</div>
+            </div>
+            <div style="text-align: right;">
+              <span class="tag" style="background: rgba(244, 114, 182, 0.1); color: #f472b6">${vol.Driver}</span>
+            </div>
+          </div>
+        `
+      }).join('')
+
+    return `
+      <div style="margin-bottom: 24px;">
+        <div style="padding: 12px 16px; background: rgba(0,0,0,0.2); border-radius: 8px 8px 0 0; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+          <span>💾 ${node.name}</span>
+          <span style="font-size: 13px; opacity: 0.7;">${nodeStats.total} 个存储卷</span>
+        </div>
+        <div style="background: rgba(0,0,0,0.1); border-radius: 0 0 8px 8px;">
+          ${listItems}
+        </div>
+      </div>
+    `
+  }).join('')
+
+  const header = `
+    <div class="header">
+      <div class="header-title">${title}</div>
+      <div class="header-badge">Total: ${stats.total} volumes</div>
+    </div>
+  `
+
+  return wrapHtml(header + '<div class="content">' + content + '</div>')
+}
