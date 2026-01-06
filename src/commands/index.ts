@@ -8,6 +8,7 @@ import { registerControlCommands } from './control'
 import { registerLogsCommand } from './logs'
 import { registerComposeCommand } from './compose'
 import { registerResourceCommands } from './resources'
+import { registerUpdateCommands } from './update'
 import { generateNodesHtml, generateNodeDetailHtml, generateExecHtml, renderToImage } from '../utils/render'
 
 /**
@@ -29,6 +30,7 @@ export function registerCommands(
   registerLogsCommand(ctx, getService, config)
   registerComposeCommand(ctx, getService, config)
   registerResourceCommands(ctx, getService, config)
+  registerUpdateCommands(ctx, getService)
 
   // 注册辅助指令
   registerHelperCommands(ctx, getService, config)
@@ -42,7 +44,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
   /**
    * 查看节点列表
    */
-  ctx.command('docker.nodes', '查看节点').alias('docker节点', '容器节点').action(async () => {
+  ctx.command('docker.nodes', '查看节点').alias('节点列表', '节点').action(async () => {
     const service = getService()
     if (!service) {
       return 'Docker 服务未初始化'
@@ -84,7 +86,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
    */
   ctx
     .command('docker.node <selector>', '查看节点详情')
-    .alias('docker节点详情', '容器节点详情')
+    .alias('节点详情', '查看节点')
     .action(async (_, selector) => {
       const service = getService()
       if (!service) {
@@ -151,7 +153,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
    */
   ctx
     .command('docker.find <container>', '搜索容器')
-    .alias('docker查找', '容器查找', 'docker搜索', '容器搜索')
+    .alias('查找容器', '搜索', '查找')
     .option('all', '-a 包含已停止的容器', { fallback: false })
     .action(async ({ options }, container) => {
       const service = getService()
@@ -185,7 +187,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
    */
   ctx
     .command('docker.exec <container> <cmd>', '在容器中执行命令')
-    .alias('docker执行', '容器执行', 'dockerexec', 'dockercmd', 'docker命令', '容器命令')
+    .alias('容器执行', '执行')
     .option('node', '-n <node> 指定节点', { fallback: '' })
     .action(async ({ options }, container, cmd) => {
       const service = getService()
@@ -231,7 +233,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
   /**
    * 查看帮助
    */
-  ctx.command('docker.help', '查看帮助').alias('docker帮助', 'docker帮助', '容器帮助').action(async () => {
+  ctx.command('docker.help', '查看帮助').alias('帮助').action(async () => {
     return [
       '=== Docker Control 帮助 ===',
       '',
@@ -247,6 +249,12 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
       '  docker.logs <节点> <容器> [-n 行数] - 查看日志',
       '  docker.inspect <节点> <容器> - 查看容器详情',
       '  docker.exec <节点> <容器> <命令> - 在容器内执行命令',
+      '',
+      '【更新操作】',
+      '  docker.check <节点> <容器> - 检查镜像更新',
+      '  docker.update <节点> <容器> [-b] - 更新容器 (-b 备份)',
+      '  docker.backup <节点> <容器> [tag] - 备份容器为镜像',
+      '  docker.set <节点> <容器> -e KEY=VALUE - 修改环境变量',
       '',
       '【资源操作】',
       '  docker.images <节点>       - 查看镜像列表 [-f image]',

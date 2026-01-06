@@ -14,7 +14,7 @@ export function registerResourceCommands(ctx: Context, getService: () => any, co
    */
   ctx
     .command('docker.images [selector]', '查看镜像列表')
-    .alias('docker镜像', '镜像列表', 'docker镜像列表')
+    .alias('镜像列表', '查看镜像', '容器镜像')
     .option('format', '-f <format> 输出格式: simple|image', {
       fallback: null, // 由 config.imageOutput 决定
     })
@@ -109,7 +109,7 @@ export function registerResourceCommands(ctx: Context, getService: () => any, co
    */
   ctx
     .command('docker.networks [selector]', '查看网络列表')
-    .alias('docker网络', '网络列表', 'docker网络列表')
+    .alias('网络列表', '查看网络', '容器网络')
     .option('format', '-f <format> 输出格式: simple|image', {
       fallback: null, // 由 config.imageOutput 决定
     })
@@ -206,7 +206,7 @@ export function registerResourceCommands(ctx: Context, getService: () => any, co
    */
   ctx
     .command('docker.volumes [selector]', '查看存储卷列表')
-    .alias('docker卷', 'docker存储卷', '存储卷列表', 'docker存储卷列表')
+    .alias('存储卷列表', '查看存储卷', '容器存储卷', '容器卷')
     .option('format', '-f <format> 输出格式: simple|image', {
       fallback: null, // 由 config.imageOutput 决定
     })

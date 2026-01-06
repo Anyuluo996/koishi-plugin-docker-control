@@ -26,7 +26,7 @@ export function registerLogsCommand(
 
   ctx
     .command('docker.logs <node> <container>', '查看容器日志')
-    .alias('docker日志', '容器日志', 'docker查看日志', '容器查看日志', 'dockerlogs')
+    .alias('容器日志', '查看日志', '日志')
     .option('lines', '-n <lines:number> 显示最后 N 行')
     .option('timestamp', '-t 显示时间戳')
     .option('all', '-a 显示全部（不截断）')

@@ -59,7 +59,7 @@ export function registerControlCommands(
    */
   ctx
     .command('docker.start <selector> <container>', '启动容器')
-    .alias('docker启动', '容器启动', 'docker开启', '容器开启')
+    .alias('容器启动', '启动', '容器开启')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
     .action(async ({ options }, selector, container) => {
       commandLogger.debug(`docker.start 被调用: selector=${selector}, container=${container}`)
@@ -122,7 +122,7 @@ export function registerControlCommands(
    */
   ctx
     .command('docker.stop <selector> <container>', '停止容器')
-    .alias('docker停止', '容器停止', 'docker关闭', '容器关闭')
+    .alias('容器停止', '停止', '容器关闭')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
     .action(async ({ options }, selector, container) => {
       commandLogger.debug(`docker.stop 被调用: selector=${selector}, container=${container}`)
@@ -179,7 +179,7 @@ export function registerControlCommands(
    */
   ctx
     .command('docker.restart <selector> <container>', '重启容器')
-    .alias('docker重启', '容器重启')
+    .alias('容器重启', '重启')
     .option('async', '-a 异步执行，不等待结果', { fallback: false })
     .action(async ({ options }, selector, container) => {
       commandLogger.debug(`docker.restart 被调用: selector=${selector}, container=${container}`)
@@ -236,7 +236,7 @@ export function registerControlCommands(
    */
   ctx
     .command('docker.inspect <selector> <container>', '查看容器详情')
-    .alias('docker详情', '容器详情', 'docker检查', '容器检查')
+    .alias('容器详情', '容器检查', '检查')
     .action(async (_, selector, container) => {
       const service = getService()
       if (!service) {

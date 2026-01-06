@@ -489,6 +489,251 @@ export class DockerNode {
   }
 
   /**
+   * 拉取镜像（智能模式，避免重复拉取）
+   * @param image 镜像名称 (e.g. redis:latest)
+   * @param force 是否强制拉取（忽略本地缓存）
+   */
+  async pullImage(image: string, force = false): Promise<{ pulled: boolean; reason: string }> {
+    if (!this.dockerode || !this.dockerApiAvailable) {
+      throw new Error('API 不可用，无法拉取镜像')
+    }
+
+    // 如果不强制拉取，先检查本地是否存在该镜像
+    if (!force) {
+      try {
+        const localImage = this.dockerode.getImage(image)
+        await localImage.inspect()
+        return { pulled: false, reason: '镜像已存在于本地' }
+      } catch {
+        // 本地不存在，继续拉取
+      }
+    }
+
+    const stream = await this.dockerode.pull(image)
+    // 等待流结束 (Dockerode 返回的是一个 Stream，必须读完才算 Pull 完成)
+    await new Promise((resolve, reject) => {
+      this.dockerode!.modem.followProgress(stream, (err: any, res: any) => {
+        if (err) reject(err)
+        else resolve(res)
+      })
+    })
+    return { pulled: true, reason: force ? '强制拉取' : '镜像不存在，已拉取' }
+  }
+
+  /**
+   * 检查镜像是否有更新
+   * 原理：对比容器当前使用的 ImageID 和拉取最新 tag 后的 ImageID
+   */
+  async checkImageUpdate(containerId: string): Promise<{ hasUpdate: boolean; currentId: string; remoteId: string; image: string }> {
+    if (!this.dockerode || !this.dockerApiAvailable) {
+      throw new Error('API 不可用')
+    }
+
+    const container = this.dockerode.getContainer(containerId)
+    const info = await container.inspect()
+    const imageName = info.Config.Image
+    const currentImageId = info.Image // 本地正在使用的镜像 ID
+
+    // 强制拉取最新镜像以检查更新
+    await this.pullImage(imageName, true)
+
+    // 获取 pull 之后该 tag 指向的最新 ID
+    const newImage = this.dockerode.getImage(imageName)
+    const newInspect = await newImage.inspect()
+    const newImageId = newInspect.Id
+
+    return {
+      hasUpdate: currentImageId !== newImageId,
+      currentId: currentImageId,
+      remoteId: newImageId,
+      image: imageName
+    }
+  }
+
+  /**
+   * 备份容器 (Commit)
+   * 将当前容器保存为一个新镜像
+   * @param containerId 容器 ID
+   * @param tag 备份标签（可选）
+   * @param skipExisting 是否跳过已存在的备份（通过哈希值判断）
+   */
+  async backupContainer(containerId: string, tag?: string, skipExisting = true): Promise<{ success: boolean; backupTag: string; reason: string }> {
+    if (!this.dockerode || !this.dockerApiAvailable) throw new Error('API 不可用')
+
+    const container = this.dockerode.getContainer(containerId)
+    const info = await container.inspect()
+    const name = info.Name.replace('/', '')
+    const currentImageId = info.Image
+
+    // 默认 Tag 格式: 容器名:backup-时间戳
+    const backupTag = tag || `${name}:backup-${Math.floor(Date.now() / 1000)}`
+    const [repo, tagName] = backupTag.split(':')
+
+    // 检查是否已存在同名镜像且内容相同（通过哈希值判断）
+    if (skipExisting) {
+      try {
+        const existingImage = this.dockerode.getImage(backupTag)
+        const existingInfo = await existingImage.inspect()
+
+        // 如果镜像的根文件系统 ID 与容器当前使用的镜像相同，说明内容没变
+        if (existingInfo.Id === currentImageId) {
+          return { success: false, backupTag, reason: '备份已存在且内容相同（哈希值一致）' }
+        }
+      } catch {
+        // 不存在，继续创建备份
+      }
+    }
+
+    await container.commit({
+      repo: repo,
+      tag: tagName || 'latest',
+      comment: 'Backup by Docker Control Plugin',
+      pause: true // 暂停容器以确保文件系统一致性
+    })
+
+    return { success: true, backupTag, reason: '备份已创建' }
+  }
+
+  /**
+   * 重建/更新容器
+   * 流程：重命名旧容器 -> 创建新容器 -> 启动新容器 -> 停止并删除旧容器
+   */
+  async recreateContainer(
+    containerId: string,
+    options: { env?: string[]; portBindings?: Record<string, any> } = {},
+    updateImage = false
+  ): Promise<{ success: boolean; newId?: string; error?: string }> {
+    if (!this.dockerode || !this.dockerApiAvailable) throw new Error('API 不可用')
+
+    const container = this.dockerode.getContainer(containerId)
+    const info = await container.inspect()
+    const containerName = info.Name.replace('/', '')
+    const wasRunning = info.State.Running
+    const originalContainerId = info.Id
+
+    // 1. 准备配置
+    const originalConfig = info.Config
+    const originalHostConfig = info.HostConfig
+    const networkingConfig = info.NetworkSettings.Networks
+
+    // 确保使用 Tag 名 (如 redis:alpine) 而不是 ID
+    const imageToUse = originalConfig.Image
+
+    // 合并环境变量 (覆盖/追加模式)
+    let newEnv = originalConfig.Env || []
+    if (options.env && options.env.length > 0) {
+      const envMap = new Map()
+      // 先载入旧变量
+      newEnv.forEach(e => {
+        const parts = e.split('=')
+        const k = parts[0]
+        envMap.set(k, e)
+      })
+      // 覆盖新变量
+      options.env.forEach(e => {
+        const parts = e.split('=')
+        const k = parts[0]
+        envMap.set(k, e)
+      })
+      newEnv = Array.from(envMap.values())
+    }
+
+    // 2. 重命名旧容器（保持运行状态，以便回滚）
+    const tempName = `${containerName}_old_${Random.id(4)}`
+    try {
+      await container.rename({ name: tempName })
+    } catch (e: any) {
+      nodeLogger.warn(`[${this.name}] 重命名容器失败: ${e.message}`)
+    }
+
+    let newContainerId: string | undefined
+
+    try {
+      // 3. 创建新容器
+      const createOptions = {
+        name: containerName,
+        Image: imageToUse,
+        Env: newEnv,
+        Cmd: originalConfig.Cmd,
+        Entrypoint: originalConfig.Entrypoint,
+        WorkingDir: originalConfig.WorkingDir,
+        User: originalConfig.User,
+        Tty: originalConfig.Tty,
+        OpenStdin: originalConfig.OpenStdin,
+        // 继承 HostConfig (端口映射、挂载卷、重启策略等)
+        HostConfig: originalHostConfig,
+        NetworkingConfig: {
+          EndpointsConfig: networkingConfig
+        }
+      }
+
+      const newContainer = await this.dockerode.createContainer(createOptions)
+      newContainerId = newContainer.id
+
+      // 4. 启动新容器
+      await newContainer.start()
+
+      // 5. 新容器成功运行，停止并删除旧容器
+      const oldContainer = this.dockerode.getContainer(originalContainerId)
+      try {
+        // 尝试停止旧容器
+        await oldContainer.stop({ t: 0 })
+      } catch (e: any) {
+        // 如果已经停止或不存在，忽略错误
+        if (!e.message.includes('already stopped') && !e.message.includes('No such container')) {
+          nodeLogger.warn(`[${this.name}] 停止旧容器失败: ${e.message}`)
+        }
+      }
+
+      try {
+        // 删除旧容器
+        await oldContainer.remove({ force: true })
+      } catch (e: any) {
+        // 如果已经删除，忽略错误
+        if (!e.message.includes('No such container')) {
+          nodeLogger.warn(`[${this.name}] 删除旧容器失败: ${e.message}`)
+        }
+      }
+
+      return { success: true, newId: newContainerId }
+
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 重建容器失败，尝试回滚: ${e.message}`)
+
+      // 回滚逻辑：删除失败的新容器，重命名并启动旧容器
+      try {
+        // 如果创建了新容器，先删除
+        if (newContainerId) {
+          try {
+            const failedNewContainer = this.dockerode.getContainer(newContainerId)
+            await failedNewContainer.remove({ force: true })
+          } catch (removeError: any) {
+            nodeLogger.warn(`[${this.name}] 删除失败的新容器时出错: ${removeError.message}`)
+          }
+        }
+
+        // 重命名旧容器回原名称
+        const oldContainer = this.dockerode.getContainer(originalContainerId)
+        await oldContainer.rename({ name: containerName })
+
+        // 如果旧容器原本是运行状态，尝试启动
+        if (wasRunning) {
+          try {
+            await oldContainer.start()
+          } catch (startError: any) {
+            // 启动失败，可能是因为容器已经停止
+            nodeLogger.warn(`[${this.name}] 启动旧容器失败: ${startError.message}`)
+          }
+        }
+
+        return { success: false, error: `更新失败，已回滚: ${e.message}` }
+      } catch (rollbackError: any) {
+        return { success: false, error: `更新失败且回滚失败(需人工干预): ${e.message} -> ${rollbackError.message}` }
+      }
+    }
+  }
+
+  /**
    * 初始化 Dockerode
    * 根据配置决定连接本地 Socket 还是通过 SSH 连接远程
    */
