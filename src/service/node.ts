@@ -120,9 +120,9 @@ export class DockerNode {
       const currentInterval = isInitialAttempts ? RETRY_INTERVAL : LONG_RETRY_INTERVAL
 
       if (isInitialAttempts) {
-        nodeLogger.info(`[${this.name}] 连接尝试 ${attempt}/${MAX_INITIAL_ATTEMPTS}...`)
+        nodeLogger.debug(`[${this.name}] 连接尝试 ${attempt}/${MAX_INITIAL_ATTEMPTS}...`)
       } else {
-        nodeLogger.info(`[${this.name}] 连接尝试 ${attempt} (每 ${LONG_RETRY_INTERVAL / 1000} 秒重试)...`)
+        nodeLogger.debug(`[${this.name}] 连接尝试 ${attempt} (每 ${LONG_RETRY_INTERVAL / 1000} 秒重试)...`)
       }
 
       try {
@@ -141,7 +141,7 @@ export class DockerNode {
 
           // 测试 SSH 命令（这会建立第 1 个 SSH 连接）
           await connector.exec('docker version --format "{{.Server.Version}}"')
-          nodeLogger.info(`[${this.name}] ⚠ 已启用 SSH 命令模式`)
+          nodeLogger.debug(`[${this.name}] ⚠ 已启用 SSH 命令模式`)
         } else {
           // API 可用：创建一个懒加载的 connector（不立即连接）
           // 只有当真正需要执行 SSH 命令时才建立连接
@@ -149,12 +149,12 @@ export class DockerNode {
           this.connector = connector
           // 标记为 connected（但实际 SSH 连接尚未建立）
           connector.setConnected(true)
-          nodeLogger.info(`[${this.name}] ✅ Connector 已创建（懒加载模式，使用时才连接）`)
+          nodeLogger.debug(`[${this.name}] ✅ Connector 已创建（懒加载模式，使用时才连接）`)
         }
 
         this.status = NodeStatus.CONNECTED
         const mode = this.dockerApiAvailable ? 'Docker API (SSH隧道复用)' : 'SSH 命令模式'
-        nodeLogger.info(`[${this.name}] 连接成功 [模式: ${mode}]`)
+        nodeLogger.info(`[${this.name}] ✅ 连接成功 [模式: ${mode}]`)
 
         // 启动监控 (此时 API 已就绪，startEventStream 会复用 API 连接，不会产生新登录)
         this.startMonitoring()
@@ -172,7 +172,7 @@ export class DockerNode {
         return
       } catch (error: unknown) {
         const lastError = error instanceof Error ? error : new Error(String(error))
-        nodeLogger.warn(`[${this.name}] 连接失败: ${lastError.message}`)
+        nodeLogger.warn(`[${this.name}] ❌ 连接失败: ${lastError.message}`)
 
         // 清理连接
         this.disposeSshClient()
@@ -181,7 +181,7 @@ export class DockerNode {
         this.dockerode = null // 确保清理
 
         // 等待后重试
-        nodeLogger.info(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
+        nodeLogger.debug(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
         await new Promise(resolve => setTimeout(resolve, currentInterval))
       }
     }
@@ -1491,7 +1491,7 @@ export class DockerNode {
         }
       }
 
-      nodeLogger.info(`[${this.name}] 正在建立 SSH 主连接...`)
+      nodeLogger.debug(`[${this.name}] 正在建立 SSH 主连接...`)
 
       // 3. 建立 SSH 连接
       this.sshClient = new SshClient()
@@ -1522,7 +1522,7 @@ export class DockerNode {
         }
       })
 
-      nodeLogger.info(`[${this.name}] ✅ SSH 主连接建立成功 (单次登录，复用所有API请求)`)
+      nodeLogger.debug(`[${this.name}] ✅ SSH 主连接建立成功 (单次登录，复用所有API请求)`)
 
       // 4. 创建自定义 Agent，劫持 createConnection
       // 这允许 dockerode 的所有请求都复用这一个 SSH 连接
@@ -1559,14 +1559,14 @@ export class DockerNode {
         agent: agent,
       } as any
 
-      nodeLogger.info(`[${this.name}] 🔨 创建 Dockerode 实例 (使用自定义 Agent)`)
+      nodeLogger.debug(`[${this.name}] 🔨 创建 Dockerode 实例 (使用自定义 Agent)`)
       this.dockerode = new Dockerode(dockerOptions)
 
       // 测试 API
-      nodeLogger.info(`[${this.name}] 🔍 测试 Docker API 连接...`)
+      nodeLogger.debug(`[${this.name}] 🔍 测试 Docker API 连接...`)
       await this.dockerode.ping()
       this.dockerApiAvailable = true
-      nodeLogger.info(`[${this.name}] ✅ Docker API 隧道测试成功 (所有请求复用单条 SSH 连接)`)
+      nodeLogger.debug(`[${this.name}] ✅ Docker API 隧道测试成功 (所有请求复用单条 SSH 连接)`)
 
     } catch (e: any) {
       this.disposeSshClient()
@@ -2013,7 +2013,7 @@ export class DockerNode {
     // 启动API健康检查
     this.startHealthCheck()
 
-    nodeLogger.info(`[${this.name}] 监控已启动 (事件流 + API健康检查)`)
+    nodeLogger.debug(`[${this.name}] 监控已启动 (事件流 + API健康检查)`)
   }
 
   /**
@@ -2154,18 +2154,18 @@ export class DockerNode {
       }
     }
 
-    nodeLogger.info(`[${this.name}] 🚀 启动事件流监听...`)
+    nodeLogger.debug(`[${this.name}] 🚀 启动事件流监听...`)
 
     // === 方案 1: 优先使用 Docker API (dockerode) ===
     // 优点: 复用已有的 Keep-Alive 连接，不会因为静默被防火墙切断
     if (this.dockerode && this.dockerApiAvailable) {
       try {
-        nodeLogger.info(`[${this.name}] 尝试使用 Docker API 获取事件流 (推荐模式，有心跳保护)`)
-        nodeLogger.info(`[${this.name}] 🔍 调用 dockerode.getEvents() (这可能会建立新的 SSH 连接)`)
+        nodeLogger.debug(`[${this.name}] 尝试使用 Docker API 获取事件流`)
+        nodeLogger.debug(`[${this.name}] 🔍 调用 dockerode.getEvents()`)
         const stream = await this.dockerode.getEvents({
           filters: { type: ['container'] }
         })
-        nodeLogger.info(`[${this.name}] ✅ getEvents() 成功返回流对象`)
+        nodeLogger.debug(`[${this.name}] ✅ getEvents() 成功返回流对象`)
 
         // 处理数据流
         stream.on('data', (chunk: Buffer) => {
@@ -2204,7 +2204,7 @@ export class DockerNode {
         }
 
         ;(this as any)._startingStream = false
-        nodeLogger.info(`[${this.name}] ✅ API 事件流已连接 (享受心跳保护，不会超时)`)
+        nodeLogger.debug(`[${this.name}] ✅ API 事件流已连接`)
         return
       } catch (e: any) {
         nodeLogger.warn(`[${this.name}] API 事件流启动失败: ${e.message}，降级到 SSH 命令`)

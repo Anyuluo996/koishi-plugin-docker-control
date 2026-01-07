@@ -135,18 +135,18 @@ export function apply(ctx: Context, config: DockerControlConfig) {
   }
 
   // 🔍 诊断：打印原始配置信息
-  logger.info('=== 配置诊断 ===')
-  logger.info(`配置中的节点数量: ${config.nodes?.length || 0}`)
+  logger.debug('=== 配置诊断 ===')
+  logger.debug(`配置中的节点数量: ${config.nodes?.length || 0}`)
   if (config.nodes && config.nodes.length > 0) {
     for (const node of config.nodes) {
-      logger.info(`节点 [${node.name}]:`)
-      logger.info(`  ID: ${node.id}`)
-      logger.info(`  Host: ${node.host}`)
-      logger.info(`  Port: ${node.port} (类型: ${typeof node.port})`)
-      logger.info(`  Credential: ${node.credentialId}`)
+      logger.debug(`节点 [${node.name}]:`)
+      logger.debug(`  ID: ${node.id}`)
+      logger.debug(`  Host: ${node.host}`)
+      logger.debug(`  Port: ${node.port} (类型: ${typeof node.port})`)
+      logger.debug(`  Credential: ${node.credentialId}`)
     }
   }
-  logger.info('================')
+  logger.debug('================')
 
   // 🔧 第一道防线：在插件入口处清理配置
   if (config.nodes) {
@@ -218,18 +218,18 @@ export function apply(ctx: Context, config: DockerControlConfig) {
       healthCheckInterval: 60000,
     }
     connectionPool = new SSHConnectionPool(poolConfig)
-    logger.info('✅ SSH 连接池已启用')
+    logger.debug('✅ SSH 连接池已启用')
   } else {
-    logger.info('⚪ SSH 连接池已禁用')
+    logger.debug('⚪ SSH 连接池已禁用')
   }
 
   // 初始化缓存管理器
   if (config.cache?.enabled !== false) {
     const cacheConfig = config.cache || { enabled: true }
     cacheManager = new CacheManager(cacheConfig)
-    logger.info('✅ 缓存管理器已启用')
+    logger.debug('✅ 缓存管理器已启用')
   } else {
-    logger.info('⚪ 缓存管理器已禁用')
+    logger.debug('⚪ 缓存管理器已禁用')
   }
 
   // 初始化权限管理器
@@ -237,9 +237,9 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     const permConfig = config.permissions
     permissionManager = new PermissionManager(ctx, permConfig)
     dockerService.permissionManager = permissionManager
-    logger.info('✅ 权限管理器已启用')
+    logger.debug('✅ 权限管理器已启用')
   } else {
-    logger.info('⚪ 权限管理器已禁用')
+    logger.debug('⚪ 权限管理器已禁用')
   }
 
   // 初始化审计日志
@@ -251,9 +251,9 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     }
     auditLogger = new AuditLogger(ctx, auditConfig)
     dockerService.auditLogger = auditLogger
-    logger.info('✅ 审计日志已启用')
+    logger.debug('✅ 审计日志已启用')
   } else {
-    logger.info('⚪ 审计日志已禁用')
+    logger.debug('⚪ 审计日志已禁用')
   }
 
   // 初始化重连管理器
@@ -267,9 +267,9 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     }
     reconnectManager = new ReconnectManager(reconnectConfig)
     dockerService.reconnectManager = reconnectManager
-    logger.info('✅ 自动重连已启用')
+    logger.debug('✅ 自动重连已启用')
   } else {
-    logger.info('⚪ 自动重连已禁用')
+    logger.debug('⚪ 自动重连已禁用')
   }
 
   // 插件就绪时初始化（异步，不阻塞 Koishi 启动）
@@ -636,11 +636,11 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     })
   }
 
-  logger.info('Docker Control 插件已加载')
+  logger.debug('Docker Control 插件已加载')
 
   // 插件卸载时清理
   ctx.on('dispose', async () => {
-    logger.info('Docker Control 插件正在卸载...')
+    logger.debug('Docker Control 插件正在卸载...')
     eventUnsub()
     await dockerService.stopAll()
   })

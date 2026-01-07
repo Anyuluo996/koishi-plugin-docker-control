@@ -228,7 +228,7 @@ export class DockerConnector {
           return
         }
 
-        connectorLogger.info(`[${this.config.name}] ✅ Docker 事件流已建立长连接 (docker events --format json --filter type=container)`)
+        connectorLogger.debug(`[${this.config.name}] ✅ Docker 事件流已建立长连接`)
         let buffer = ''
         let closed = false
 
@@ -244,7 +244,7 @@ export class DockerConnector {
             } catch (e) {
               // 可能已经关闭，忽略错误
             }
-            connectorLogger.info(`[${this.config.name}] 🔒 主动停止事件流`)
+            connectorLogger.debug(`[${this.config.name}] 🔒 主动停止事件流`)
           }
         }
 
@@ -252,7 +252,7 @@ export class DockerConnector {
           if (!closed) {
             closed = true
             connectorLogger.error(`[${this.config.name}] ❌ 事件流意外断开！Code: ${code}, Signal: ${signal}`)
-            connectorLogger.error(`[${this.config.name}] ⚠ 事件流断开后，node.ts 会自动重连 (将产生新的SSH登录记录)`)
+            connectorLogger.debug(`[${this.config.name}] ⚠ 事件流断开后，node.ts 会自动重连`)
           }
         })
 
@@ -296,7 +296,7 @@ export class DockerConnector {
    */
   dispose() {
     if (this.sshClient) {
-      connectorLogger.info(`[${this.config.name}] 主动销毁 SSH 连接`)
+      connectorLogger.debug(`[${this.config.name}] 主动销毁 SSH 连接`)
       this.sshClient.end()
       this.sshClient = null
     }
@@ -325,21 +325,21 @@ export class DockerConnector {
       ? parseInt(this.config.port, 10)
       : (this.config.port || 22)
 
-    connectorLogger.info(`[${this.config.name}] 🔗 建立新的SSH连接...`)
-    connectorLogger.info(`[${this.config.name}] 目标: ${credential.username}@${this.config.host}:${port}`)
-    connectorLogger.info(`[${this.config.name}] 认证方式: ${credential.authType}`)
+    connectorLogger.debug(`[${this.config.name}] 🔗 建立新的SSH连接...`)
+    connectorLogger.debug(`[${this.config.name}] 目标: ${credential.username}@${this.config.host}:${port}`)
+    connectorLogger.debug(`[${this.config.name}] 认证方式: ${credential.authType}`)
 
     return new Promise((resolve, reject) => {
       const conn = new Client()
 
       conn.on('ready', () => {
-        connectorLogger.info(`[${this.config.name}] ✅ SSH连接成功 (user=${credential.username}, host=${this.config.host}, port=${port})`)
+        connectorLogger.debug(`[${this.config.name}] ✅ SSH连接成功 (user=${credential.username}, host=${this.config.host}, port=${port})`)
         resolve(conn)
       })
 
       conn.on('error', (err: any) => {
         connectorLogger.error(`[${this.config.name}] ❌ SSH连接失败: ${err.message} (host=${this.config.host}, port=${port})`)
-        connectorLogger.error(`[${this.config.name}] ⚠ 连接失败后将在片刻重试 (重试会产生新的SSH登录记录)`)
+        connectorLogger.debug(`[${this.config.name}] ⚠ 连接失败后将在片刻重试`)
         conn.end()
         reject(err)
       })

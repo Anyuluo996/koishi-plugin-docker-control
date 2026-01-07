@@ -64,7 +64,7 @@ export class DockerService {
    * 初始化所有节点
    */
   async initialize(): Promise<void> {
-    logger.info('初始化 Docker 服务...')
+    logger.debug('初始化 Docker 服务...')
 
     const nodeConfigs = this.config.nodes || []
     const credentials = this.config.credentials || []
@@ -89,7 +89,7 @@ export class DockerService {
       })
 
       this.nodes.set(nodeConfig.id, node)
-      logger.info(`节点已创建: ${nodeConfig.name} (${nodeConfig.id})`)
+      logger.debug(`节点已创建: ${nodeConfig.name} (${nodeConfig.id})`)
     }
 
     this.logNodeList()
@@ -118,7 +118,7 @@ export class DockerService {
       (n) => n.status === 'error' || n.status === 'disconnected'
     ).length
 
-    logger.info(`连接完成: ${online} 在线, ${offline} 离线`)
+    logger.info(`✅ 连接完成: ${online} 在线, ${offline} 离线`)
 
     // v0.1.0 新增: 为所有节点设置断线监听
     this.setupReconnectHandlers()
@@ -133,7 +133,7 @@ export class DockerService {
       return
     }
 
-    logger.info('设置节点自动重连监听器...')
+    logger.debug('设置节点自动重连监听器...')
 
     // 监听所有节点的事件
     for (const node of this.nodes.values()) {
@@ -154,9 +154,9 @@ export class DockerService {
     if (!this.reconnectManager) return
 
     try {
-      logger.info(`开始重连节点 ${node.name}...`)
+      logger.debug(`开始重连节点 ${node.name}...`)
       await this.reconnectManager.reconnect(node)
-      logger.info(`节点 ${node.name} 重连成功`)
+      logger.info(`✅ 节点 ${node.name} 重连成功`)
     } catch (e) {
       logger.error(`节点 ${node.name} 重连失败: ${e.message}`)
     }
@@ -334,12 +334,12 @@ export class DockerService {
   }
 
   private logNodeList(): void {
-    logger.info('=== Docker 节点列表 ===')
+    logger.debug('=== Docker 节点列表 ===')
     for (const node of this.nodes.values()) {
       const tags = node.tags.length > 0 ? ` [@${node.tags.join(' @')}]` : ''
-      logger.info(`  - ${node.name} (${node.id})${tags}`)
+      logger.debug(`  - ${node.name} (${node.id})${tags}`)
     }
-    logger.info('======================')
+    logger.debug('======================')
   }
 
   /**
@@ -362,7 +362,7 @@ export class DockerService {
     }
     this.nodes.clear()
     this.eventCallbacks.clear()
-    logger.info('Docker 服务已停止')
+    logger.debug('Docker 服务已停止')
   }
 
   /**
