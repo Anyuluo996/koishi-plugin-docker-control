@@ -170,12 +170,15 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
           return await renderToImage(ctx, html)
         }
 
-        const memoryUsed = systemInfo?.MemTotal && systemInfo?.MemAvailable !== undefined
-          ? `${Math.round((1 - systemInfo.MemAvailable / systemInfo.MemTotal) * 100)}%`
-          : '-'
-
         const nodeName = node.config?.name || node.name || node.Name || 'Unknown'
         const nodeId = node.id || node.ID || node.Id || node.config?.id || '-'
+
+        // 格式化内存显示：总内存量
+        let memoryDisplay = '-'
+        if (systemInfo?.MemTotal) {
+          const memGB = (systemInfo.MemTotal / 1024 / 1024 / 1024).toFixed(2)
+          memoryDisplay = `${memGB} GB`
+        }
 
         const lines = [
           `=== ${nodeName} ===`,
@@ -183,7 +186,7 @@ function registerHelperCommands(ctx: Context, getService: GetService, config?: a
           `状态: ${node.status || node.Status || 'unknown'}`,
           `标签: ${node.tags?.join(', ') || node.config?.tags?.join(', ') || '无'}`,
           `CPU: ${systemInfo?.NCPU || '-'} 核心`,
-          `内存: ${memoryUsed} (可用: ${systemInfo?.MemAvailable ? Math.round(systemInfo.MemAvailable / 1024 / 1024) + ' MB' : '-'})`,
+          `内存: ${memoryDisplay}`,
           `容器: ${containerCount.running}/${containerCount.total} 运行中`,
           `镜像: ${imageCount} 个`,
           `Docker 版本: ${version.Version}`,

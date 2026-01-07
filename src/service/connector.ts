@@ -19,6 +19,14 @@ export class DockerConnector {
   }
 
   /**
+   * 获取内部 SSH Client（用于连接复用）
+   * 如果尚未连接，会触发连接建立
+   */
+  async getSshClient(): Promise<Client> {
+    return await this.getConnection()
+  }
+
+  /**
    * 验证并修正配置
    */
   private validateConfig(): void {
@@ -55,7 +63,8 @@ export class DockerConnector {
 
         // 如果是 SSH 通道打开失败，或者是连接已结束，则强制重连
         if (msg.includes('Channel open failure') || msg.includes('Client ended') || msg.includes('Socket ended')) {
-          connectorLogger.warn(`[${this.config.name}] SSH 连接异常 (${msg})，尝试重连...`)
+          connectorLogger.warn(`[${this.config.name}] ⚠ SSH连接异常: ${msg}，尝试重连...`)
+          connectorLogger.debug(`[${this.config.name}] 重连将产生新的SSH登录记录`)
           this.dispose() // 强制销毁当前连接
           continue // 重试
         }
@@ -71,12 +80,12 @@ export class DockerConnector {
   private async execInternal(command: string): Promise<string> {
     const client = await this.getConnection()
 
-    connectorLogger.debug(`[${this.config.name}] 执行命令: ${command}`)
+    connectorLogger.debug(`[${this.config.name}] 🔧 执行SSH命令: ${command}`)
 
     return new Promise((resolve, reject) => {
       client.exec(command, (err, stream) => {
         if (err) {
-          connectorLogger.debug(`[${this.config.name}] 命令执行错误: ${err.message}`)
+          connectorLogger.warn(`[${this.config.name}] SSH命令执行失败: ${err.message}`)
           reject(err)
           return
         }
@@ -219,7 +228,7 @@ export class DockerConnector {
           return
         }
 
-        connectorLogger.info(`[${this.config.name}] Docker 事件流已连接`)
+        connectorLogger.info(`[${this.config.name}] ✅ Docker 事件流已建立长连接 (docker events --format json --filter type=container)`)
         let buffer = ''
         let closed = false
 
@@ -235,14 +244,15 @@ export class DockerConnector {
             } catch (e) {
               // 可能已经关闭，忽略错误
             }
-            connectorLogger.debug(`[${this.config.name}] 主动停止事件流`)
+            connectorLogger.info(`[${this.config.name}] 🔒 主动停止事件流`)
           }
         }
 
         stream.on('close', (code: any, signal: any) => {
           if (!closed) {
             closed = true
-            connectorLogger.warn(`[${this.config.name}] 事件流意外断开 (Code: ${code}, Signal: ${signal})`)
+            connectorLogger.error(`[${this.config.name}] ❌ 事件流意外断开！Code: ${code}, Signal: ${signal}`)
+            connectorLogger.error(`[${this.config.name}] ⚠ 事件流断开后，node.ts 会自动重连 (将产生新的SSH登录记录)`)
           }
         })
 
@@ -286,6 +296,7 @@ export class DockerConnector {
    */
   dispose() {
     if (this.sshClient) {
+      connectorLogger.info(`[${this.config.name}] 主动销毁 SSH 连接`)
       this.sshClient.end()
       this.sshClient = null
     }
@@ -310,35 +321,38 @@ export class DockerConnector {
       throw new Error(`凭证不存在: ${this.config.credentialId}`)
     }
 
-    connectorLogger.info(`[${this.config.name}] 正在连接到 ${this.config.host}:${this.config.port}`)
-    connectorLogger.debug(`[${this.config.name}] 用户名: ${credential.username}, 认证方式: ${credential.authType}`)
+    const port = typeof this.config.port === 'string'
+      ? parseInt(this.config.port, 10)
+      : (this.config.port || 22)
+
+    connectorLogger.info(`[${this.config.name}] 🔗 建立新的SSH连接...`)
+    connectorLogger.info(`[${this.config.name}] 目标: ${credential.username}@${this.config.host}:${port}`)
+    connectorLogger.info(`[${this.config.name}] 认证方式: ${credential.authType}`)
 
     return new Promise((resolve, reject) => {
       const conn = new Client()
 
       conn.on('ready', () => {
-        connectorLogger.info(`[${this.config.name}] SSH 连接成功`)
+        connectorLogger.info(`[${this.config.name}] ✅ SSH连接成功 (user=${credential.username}, host=${this.config.host}, port=${port})`)
         resolve(conn)
       })
 
       conn.on('error', (err: any) => {
-        connectorLogger.error(`[${this.config.name}] SSH 连接失败: ${err.message}`)
+        connectorLogger.error(`[${this.config.name}] ❌ SSH连接失败: ${err.message} (host=${this.config.host}, port=${port})`)
+        connectorLogger.error(`[${this.config.name}] ⚠ 连接失败后将在片刻重试 (重试会产生新的SSH登录记录)`)
         conn.end()
         reject(err)
       })
 
       conn.on('close', () => {
-        connectorLogger.debug(`[${this.config.name}] SSH 连接关闭`)
+        const reason = this.connected ? 'SSH连接意外断开' : 'SSH连接已关闭'
+        connectorLogger.warn(`[${this.config.name}] ${reason} (host=${this.config.host}, port=${this.config.port})`)
+        this.connected = false
       })
 
       conn.on('banner', (msg: string) => {
         connectorLogger.debug(`[${this.config.name}] SSH Banner: ${msg.trim()}`)
       })
-
-      // 确保 port 是数字类型
-      const port = typeof this.config.port === 'string'
-        ? parseInt(this.config.port, 10)
-        : (this.config.port || 22)
 
       const connectConfig: ConnectConfig = {
         host: this.config.host,
@@ -347,6 +361,9 @@ export class DockerConnector {
         readyTimeout: SSH_TIMEOUT,
         timeout: SSH_TIMEOUT,
         tryKeyboard: true,
+        // === 保持连接活跃，防止被服务器踢掉 ===
+        keepaliveInterval: 15000,  // 每15秒发送一次心跳
+        keepaliveCountMax: 3,      // 失败3次认为断开
         ...this.buildAuthOptions(credential),
       }
 

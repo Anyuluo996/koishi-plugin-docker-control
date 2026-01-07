@@ -3,6 +3,8 @@
  */
 import { Random, Context } from 'koishi'
 import Dockerode, { DockerOptions, NetworkInspectInfo, ContainerInspectInfo } from 'dockerode'
+import http from 'http'
+import { Client as SshClient } from 'ssh2'
 import type {
   NodeConfig,
   ContainerInfo,
@@ -38,8 +40,10 @@ export class DockerNode {
   public status: NodeStatusType = NodeStatus.DISCONNECTED
   /** Koishi Context (用于数据库操作) */
   private readonly ctx: Context
-  /** SSH 连接器 */
+  /** SSH 连接器 (Fallback用) */
   private connector: DockerConnector | null = null
+  /** 持久化 SSH 客户端 (API用) */
+  private sshClient: SshClient | null = null
   /** Dockerode 实例 (用于 API 调用) */
   private dockerode: Dockerode | null = null
   /** Docker API 是否可用 */
@@ -94,7 +98,7 @@ export class DockerNode {
 
   /**
    * 连接到 Docker (带重试)
-   * 前 3 次失败后每 1 分钟重试一次，直到成功
+   * 优化：优先尝试 API 连接，成功则不再建立多余的 SSH 命令行连接
    */
   async connect(): Promise<void> {
     if (this.status === NodeStatus.CONNECTING) {
@@ -122,26 +126,37 @@ export class DockerNode {
       }
 
       try {
-        // 创建 connector（仅建立连接，不执行命令）
-        const connector = new DockerConnector(this.config, { credentials: [this.credential], nodes: [this.config] } as any)
-        this.connector = connector
+        // === 优化策略：完全依赖 Docker API，不预创建 connector ===
+        // 只有在 API 真正失败时，才创建 connector 并建立 SSH 连接
 
-        // 尝试初始化 Dockerode (优先使用 API)
+        // 1. 先尝试初始化 Docker API（不创建 connector）
+        // 这可能会产生 1-2 个 SSH 连接（ping + getEvents）
         await this.initDockerode()
 
-        // 如果 API 不可用，测试 SSH 连接和 docker 命令
+        // 2. 只有当 API 不可用时，才创建 connector 并降级到 SSH 命令
         if (!this.dockerApiAvailable) {
-          nodeLogger.debug(`[${this.name}] Docker API 不可用，测试 SSH docker 命令`)
+          nodeLogger.warn(`[${this.name}] Docker API 不可用，创建 connector 并降级到 SSH 命令...`)
+          const connector = new DockerConnector(this.config, { credentials: [this.credential], nodes: [this.config] } as any)
+          this.connector = connector
+
+          // 测试 SSH 命令（这会建立第 1 个 SSH 连接）
           await connector.exec('docker version --format "{{.Server.Version}}"')
+          nodeLogger.info(`[${this.name}] ⚠ 已启用 SSH 命令模式`)
+        } else {
+          // API 可用：创建一个懒加载的 connector（不立即连接）
+          // 只有当真正需要执行 SSH 命令时才建立连接
+          const connector = new DockerConnector(this.config, { credentials: [this.credential], nodes: [this.config] } as any)
+          this.connector = connector
+          // 标记为 connected（但实际 SSH 连接尚未建立）
+          connector.setConnected(true)
+          nodeLogger.info(`[${this.name}] ✅ Connector 已创建（懒加载模式，使用时才连接）`)
         }
 
-        // 标记连接可用，允许事件流自动重连
-        connector.setConnected(true)
-
         this.status = NodeStatus.CONNECTED
-        nodeLogger.info(`[${this.name}] 连接成功 (SSH + ${this.dockerApiAvailable ? 'Docker API' : 'SSH 命令模式'})`)
+        const mode = this.dockerApiAvailable ? 'Docker API (SSH隧道复用)' : 'SSH 命令模式'
+        nodeLogger.info(`[${this.name}] 连接成功 [模式: ${mode}]`)
 
-        // 启动监控
+        // 启动监控 (此时 API 已就绪，startEventStream 会复用 API 连接，不会产生新登录)
         this.startMonitoring()
 
         // 触发上线事件
@@ -160,8 +175,10 @@ export class DockerNode {
         nodeLogger.warn(`[${this.name}] 连接失败: ${lastError.message}`)
 
         // 清理连接
+        this.disposeSshClient()
         this.connector?.dispose()
         this.connector = null
+        this.dockerode = null // 确保清理
 
         // 等待后重试
         nodeLogger.info(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
@@ -206,12 +223,28 @@ export class DockerNode {
   }
 
   /**
+   * 销毁 SSH 客户端
+   */
+  private disposeSshClient(): void {
+    if (this.sshClient) {
+      try {
+        nodeLogger.debug(`[${this.name}] 销毁 SSH 主连接`)
+        this.sshClient.end()
+      } catch (e) {
+        // 忽略销毁错误
+      }
+      this.sshClient = null
+    }
+  }
+
+  /**
    * 断开连接
    */
   async disconnect(): Promise<void> {
     this.stopMonitoring()
     this.clearTimers()
 
+    this.disposeSshClient()
     this.connector?.dispose()
     this.connector = null
     this.dockerode = null
@@ -338,27 +371,67 @@ export class DockerNode {
 
   /**
    * 获取系统信息 (CPU、内存)
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getSystemInfo(): Promise<{ NCPU: number; MemTotal: number; MemAvailable?: number } | null> {
-    if (!this.connector) return null
+    // 方式 1: 尝试使用 Docker API
+    nodeLogger.debug(`[${this.name}] getSystemInfo 调用: dockerode=${!!this.dockerode}, apiAvailable=${this.dockerApiAvailable}`)
+
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取系统信息`)
+        const info = await this.dockerode.info()
+
+        nodeLogger.debug(`[${this.name}] Docker API 返回: NCPU=${info.NCPU}, MemTotal=${info.MemTotal}, MemAvailable=${info.MemAvailable}`)
+
+        const result = {
+          NCPU: info.NCPU || 0,
+          MemTotal: info.MemTotal || 0,
+          MemAvailable: info.MemAvailable, // 可能不存在
+        }
+
+        nodeLogger.debug(`[${this.name}] 返回系统信息: NCPU=${result.NCPU}, MemTotal=${result.MemTotal}`)
+
+        return result
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API getSystemInfo 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取系统信息`)
+    if (!this.connector) {
+      nodeLogger.warn(`[${this.name}] connector 不存在，无法获取系统信息`)
+      return null
+    }
     try {
-      // 使用 execWithExitCode 避免非零退出码抛出异常
-      const result = await this.connector.execWithExitCode('docker info --format "{{.NCPU}} {{.MemTotal}} {{.MemAvailable}}"')
-      nodeLogger.debug(`[${this.name}] docker info 输出: "${result.output}", 退出码: ${result.exitCode}`)
-      // docker info 可能返回退出码 1 但仍有输出（权限问题），只要有输出就解析
+      // 使用 JSON 格式获取完整信息，避免字段不存在导致的问题
+      const result = await this.connector.execWithExitCode('docker info --format "{{json .}}"')
+      nodeLogger.debug(`[${this.name}] docker info 输出长度: ${result.output.length}, 退出码: ${result.exitCode}`)
+
       if (!result.output.trim()) {
         nodeLogger.warn(`[${this.name}] docker info 输出为空`)
         return null
       }
-      const parts = result.output.trim().split(/\s+/)
-      if (parts.length >= 2) {
-        return {
-          NCPU: parseInt(parts[0]) || 0,
-          MemTotal: parseInt(parts[1]) || 0,
-          MemAvailable: parts[2] ? parseInt(parts[2]) : undefined,
+
+      try {
+        const info = JSON.parse(result.output)
+        nodeLogger.debug(`[${this.name}] SSH docker info 解析: NCPU=${info.NCPU}, MemTotal=${info.MemTotal}, MemAvailable=${info.MemAvailable}`)
+
+        const sshResult = {
+          NCPU: info.NCPU || 0,
+          MemTotal: info.MemTotal || 0,
+          MemAvailable: info.MemAvailable, // 可能不存在
         }
+
+        nodeLogger.debug(`[${this.name}] SSH 返回系统信息: NCPU=${sshResult.NCPU}, MemTotal=${sshResult.MemTotal}`)
+
+        return sshResult
+      } catch (parseError) {
+        nodeLogger.warn(`[${this.name}] 解析 docker info JSON 失败: ${parseError}`)
+        nodeLogger.warn(`[${this.name}] 原始输出: ${result.output.substring(0, 200)}`)
+        return null
       }
-      return null
     } catch (e) {
       nodeLogger.warn(`[${this.name}] 获取系统信息异常: ${e}`)
       return null
@@ -1365,9 +1438,9 @@ export class DockerNode {
 
   /**
    * 初始化 Dockerode
-   * 根据配置决定连接本地 Socket 还是通过 SSH 连接远程
+   * 建立唯一的 SSH 连接，并通过 `docker system dial-stdio` 复用连接
    */
-  private async initDockerode(): Promise<void> {
+  private async initDockerode(connector?: DockerConnector): Promise<void> {
     try {
       let dockerOptions: DockerOptions
 
@@ -1375,69 +1448,132 @@ export class DockerNode {
       const isLocal = this.config.host === '127.0.0.1' || this.config.host === 'localhost'
 
       if (isLocal) {
-        // 本地连接
-        dockerOptions = {
-          socketPath: '/var/run/docker.sock',
-        }
-      } else {
-        // === 远程 SSH 连接配置 ===
-
-        // 1. 确保端口是数字
-        let portNumber = 22
-        if (typeof this.config.port === 'number') {
-          portNumber = this.config.port
-        } else if (typeof this.config.port === 'string') {
-          const parsed = parseInt(this.config.port as string, 10)
-          if (!isNaN(parsed) && parsed > 0) portNumber = parsed
-        }
-
-        // 2. 准备 SSH 认证选项
-        // 关键点：将 port 放在这里，而不是顶层
-        const sshOpts: any = {
-          port: portNumber,
-          readyTimeout: 20000,
-        }
-
-        // 注入认证信息
-        if (this.credential.authType === 'password' && this.credential.password) {
-          sshOpts.password = this.credential.password
-        } else if (this.credential.privateKey) {
-          sshOpts.privateKey = this.credential.privateKey.trim()
-          if (this.credential.passphrase) {
-            sshOpts.passphrase = this.credential.passphrase
-          }
-        }
-
-        // 3. 构建 Dockerode 配置
-        // 核心修复：
-        // - 保留 host: 让 dockerode 知道是远程连接（解决"只获取本地容器"问题）
-        // - 移除 port: 避免 docker-modem 拼接 URL 时出错（解决 "Invalid port" 问题）
-        // - sshOptions: 包含 port 和认证信息，供底层 ssh2 使用
-        dockerOptions = {
-          protocol: 'ssh',
-          host: this.config.host, // 必须保留
-          username: this.credential.username, // 必须保留
-          sshOptions: sshOpts, // 包含 port
-        } as any
-
-        nodeLogger.info(`[${this.name}] 初始化 Docker API (SSH模式): host="${this.config.host}", port=${portNumber}`)
-      }
-
-      this.dockerode = new Dockerode(dockerOptions)
-
-      // 测试连接
-      try {
+        // 本地连接：直接使用 Unix Socket
+        this.dockerode = new Dockerode({ socketPath: '/var/run/docker.sock' })
         await this.dockerode.ping()
         this.dockerApiAvailable = true
-        nodeLogger.info(`[${this.name}] Docker API 连接成功 (${isLocal ? 'Local' : 'SSH'})`)
-      } catch (e: any) {
-        this.dockerApiAvailable = false
-        nodeLogger.warn(`[${this.name}] Docker API 连接失败: ${e.message} (将降级使用 SSH 命令)`)
+        nodeLogger.info(`[${this.name}] ✅ Docker API 连接成功 (Local Socket)`)
+        return
       }
-    } catch (e) {
+
+      // === 远程 SSH 连接配置 (单连接复用方案) ===
+
+      // 1. 关闭旧连接
+      this.disposeSshClient()
+
+      // 2. 准备 SSH 配置
+      let portNumber = 22
+      if (typeof this.config.port === 'number') {
+        portNumber = this.config.port
+      } else if (typeof this.config.port === 'string') {
+        const parsed = parseInt(this.config.port as string, 10)
+        if (!isNaN(parsed) && parsed > 0) {
+          portNumber = parsed
+        }
+      }
+
+      const sshConfig: any = {
+        host: this.config.host,
+        port: portNumber,
+        username: this.credential.username,
+        readyTimeout: 20000,
+        keepaliveInterval: 10000, // 10秒心跳，防止被踢
+        keepaliveCountMax: 3,
+      }
+
+      // 注入认证信息
+      if (this.credential.authType === 'password' && this.credential.password) {
+        sshConfig.password = this.credential.password
+      } else if (this.credential.privateKey) {
+        sshConfig.privateKey = this.credential.privateKey.trim()
+        if (this.credential.passphrase) {
+          sshConfig.passphrase = this.credential.passphrase
+        }
+      }
+
+      nodeLogger.info(`[${this.name}] 正在建立 SSH 主连接...`)
+
+      // 3. 建立 SSH 连接
+      this.sshClient = new SshClient()
+
+      await new Promise<void>((resolve, reject) => {
+        if (!this.sshClient) {
+          return reject(new Error('SSH client initialization failed'))
+        }
+
+        const onReady = () => {
+          this.sshClient?.removeListener('error', onError)
+          resolve()
+        }
+        const onError = (err: Error) => {
+          this.sshClient?.removeListener('ready', onReady)
+          reject(err)
+        }
+
+        this.sshClient.on('ready', onReady).on('error', onError).connect(sshConfig)
+      })
+
+      // 监听连接断开，触发重连逻辑
+      this.sshClient.on('close', () => {
+        if (this.status === NodeStatus.CONNECTED) {
+          nodeLogger.warn(`[${this.name}] SSH 主连接已断开，触发重连`)
+          // 不直接调用 disconnect()，避免状态混乱
+          // 让上层监控逻辑处理重连
+        }
+      })
+
+      nodeLogger.info(`[${this.name}] ✅ SSH 主连接建立成功 (单次登录，复用所有API请求)`)
+
+      // 4. 创建自定义 Agent，劫持 createConnection
+      // 这允许 dockerode 的所有请求都复用这一个 SSH 连接
+      const agent = new http.Agent()
+      agent.createConnection = (options, cb) => {
+        nodeLogger.debug(`[${this.name}] 🔧 Agent.createConnection 被调用，复用 SSH 隧道`)
+
+        // 使用 docker system dial-stdio 建立到 Docker Socket 的流
+        // 这是官方 CLI 远程连接的标准方式，支持双向流
+        if (!this.sshClient) {
+          cb(new Error('SSH client not connected'), null as any)
+          return null as any
+        }
+
+        this.sshClient.exec('docker system dial-stdio', (err, stream) => {
+          if (err) {
+            nodeLogger.warn(`[${this.name}] SSH dial-stdio 失败: ${err.message}`)
+            return cb(err, null as any)
+          }
+          // stream 是双工流，可以直接作为 socket 使用
+          nodeLogger.debug(`[${this.name}] ✅ SSH 隧道已建立`)
+          cb(null, stream as any)
+        })
+
+        return null as any
+      }
+
+      // 5. 初始化 Dockerode
+      // 使用 'http' 协议欺骗 dockerode 使用我们的 agent
+      dockerOptions = {
+        protocol: 'http',
+        host: '127.0.0.1', // 这里的 host/port 会被 agent 忽略
+        port: 2375,
+        agent: agent,
+      } as any
+
+      nodeLogger.info(`[${this.name}] 🔨 创建 Dockerode 实例 (使用自定义 Agent)`)
+      this.dockerode = new Dockerode(dockerOptions)
+
+      // 测试 API
+      nodeLogger.info(`[${this.name}] 🔍 测试 Docker API 连接...`)
+      await this.dockerode.ping()
+      this.dockerApiAvailable = true
+      nodeLogger.info(`[${this.name}] ✅ Docker API 隧道测试成功 (所有请求复用单条 SSH 连接)`)
+
+    } catch (e: any) {
+      this.disposeSshClient()
       this.dockerode = null
       this.dockerApiAvailable = false
-      nodeLogger.debug(`[${this.name}] Dockerode 初始化异常: ${e}`)
+      nodeLogger.warn(`[${this.name}] Docker API 隧道建立失败: ${e.message}`)
+      throw e // 抛出错误让 connect 方法处理降级
     }
   }
 
@@ -1882,17 +2018,24 @@ export class DockerNode {
 
   /**
    * 启动 API 健康检查
+   * DPanel模式：信任底层 Keep-Alive，不主动 Ping，只在操作报错时重连
    */
   private startHealthCheck(): void {
-    // 立即检查一次
+    // 方案：移除定时器，改为惰性检查
+    // 底层 keepaliveInterval: 15s 的静默心跳已经足够防止断连
+    // 主动 Ping 是产生日志的元凶，必须移除
+
+    // 仅在启动时检查一次，确保 API 正常
     this.checkApiHealth()
 
-    // 定期检查API健康状态
+    // 不再设置定时器，完全信任底层 TCP Keep-Alive
+    /*
     this.healthCheckTimer = setInterval(async () => {
       await this.checkApiHealth()
-    }, API_HEALTH_CHECK_INTERVAL)
+    }, CHECK_INTERVAL)
+    */
 
-    nodeLogger.debug(`[${this.name}] API健康检查已启动 (间隔: ${API_HEALTH_CHECK_INTERVAL / 1000}秒)`)
+    nodeLogger.debug(`[${this.name}] API健康检查策略: 仅启动时检查 (依赖底层 TCP Keep-Alive 保活，无定时Ping)`)
   }
 
   /**
@@ -1920,7 +2063,8 @@ export class DockerNode {
         await this.dockerode.ping()
         // API健康，无需操作
       } catch (e: any) {
-        nodeLogger.warn(`[${this.name}] Docker API 健康检查失败: ${e.message}，启动降级轮询`)
+        nodeLogger.error(`[${this.name}] ❌ Docker API 健康检查失败: ${e.message}`)
+        nodeLogger.warn(`[${this.name}] ⚠ API失败后将进入降级模式，每${DEGRADED_POLL_INTERVAL / 1000}秒执行一次SSH命令`)
         this.dockerApiAvailable = false
         this.startDegradedPolling()
       }
@@ -1950,7 +2094,8 @@ export class DockerNode {
       await this.pollContainerStates()
     }, DEGRADED_POLL_INTERVAL)
 
-    nodeLogger.info(`[${this.name}] 降级轮询已启动 (间隔: ${DEGRADED_POLL_INTERVAL / 1000}秒)`)
+    nodeLogger.warn(`[${this.name}] ⚠ 进入降级模式: 每${DEGRADED_POLL_INTERVAL / 1000}秒执行一次SSH命令查询容器状态`)
+    nodeLogger.warn(`[${this.name}] ⚠ 这是产生频繁SSH登录记录的主要原因！建议修复Docker API连接以减少SSH使用`)
   }
 
   /**
@@ -1968,7 +2113,7 @@ export class DockerNode {
       this.degradedPollTimer = null
     }
 
-    nodeLogger.info(`[${this.name}] 降级轮询已停止，恢复Docker API模式`)
+    nodeLogger.info(`[${this.name}] ✅ Docker API已恢复，停止降级轮询 (不再频繁执行SSH命令)`)
   }
 
   /**
@@ -1978,9 +2123,10 @@ export class DockerNode {
     if (this.status !== NodeStatus.CONNECTED) return
 
     try {
+      nodeLogger.debug(`[${this.name}] 🔍 执行降级轮询: 使用SSH命令查询容器状态 (这会产生SSH登录记录)`)
       const containers = await this.listContainers(true)
       this.checkContainerStateChanges(containers)
-      nodeLogger.debug(`[${this.name}] 降级轮询: 检查了 ${containers.length} 个容器`)
+      nodeLogger.debug(`[${this.name}] 降级轮询完成: 检查了 ${containers.length} 个容器`)
     } catch (e) {
       nodeLogger.warn(`[${this.name}] 降级轮询失败: ${e}`)
     }
@@ -1988,41 +2134,130 @@ export class DockerNode {
 
   /**
    * 启动 Docker 事件流监听
+   * 优先使用 Docker API (长连接且有心跳)，失败降级到 SSH 命令
    */
-  private startEventStream(): void {
-    if (!this.connector) return
-
-    // 防止并发启动：使用 _startingStream 标志
+  private async startEventStream(): Promise<void> {
+    // 防止并发启动
     if ((this as any)._startingStream) {
       nodeLogger.debug(`[${this.name}] 事件流正在启动中，跳过`)
       return
     }
     ;(this as any)._startingStream = true
 
-    // 检查是否已有活跃的流
-    if ((this as any)._activeStreamCount > 0) {
-      nodeLogger.debug(`[${this.name}] 已有 ${(this as any)._activeStreamCount} 个活跃事件流，跳过启动`)
+    // 清理旧的流
+    if ((this as any)._eventStreamStop) {
+      try {
+        (this as any)._eventStreamStop()
+        ;(this as any)._eventStreamStop = null
+      } catch (e) {
+        // 忽略清理错误
+      }
+    }
+
+    nodeLogger.info(`[${this.name}] 🚀 启动事件流监听...`)
+
+    // === 方案 1: 优先使用 Docker API (dockerode) ===
+    // 优点: 复用已有的 Keep-Alive 连接，不会因为静默被防火墙切断
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.info(`[${this.name}] 尝试使用 Docker API 获取事件流 (推荐模式，有心跳保护)`)
+        nodeLogger.info(`[${this.name}] 🔍 调用 dockerode.getEvents() (这可能会建立新的 SSH 连接)`)
+        const stream = await this.dockerode.getEvents({
+          filters: { type: ['container'] }
+        })
+        nodeLogger.info(`[${this.name}] ✅ getEvents() 成功返回流对象`)
+
+        // 处理数据流
+        stream.on('data', (chunk: Buffer) => {
+          try {
+            const lines = chunk.toString().split('\n').filter(Boolean)
+            for (const line of lines) {
+              this.handleEventLine(line)
+            }
+          } catch (e) {
+            nodeLogger.debug(`[${this.name}] 处理事件数据失败: ${e}`)
+          }
+        })
+
+        // 处理错误和断开
+        const onStreamError = (err: any) => {
+          if ((this as any)._startingStream === false) return // 已经手动停止
+          nodeLogger.warn(`[${this.name}] API 事件流异常: ${err.message || 'Stream ended'}`)
+          this.restartEventStream()
+        }
+
+        stream.on('error', onStreamError)
+        stream.on('end', () => onStreamError(new Error('Stream ended')))
+        stream.on('close', () => onStreamError(new Error('Stream closed')))
+
+        // 保存停止函数
+        ;(this as any)._eventStreamStop = () => {
+          try {
+            (stream as any).destroy?.()
+            stream.off('error', onStreamError)
+            stream.off('end', onStreamError)
+            stream.off('close', onStreamError)
+            stream.off('data', () => {})
+          } catch (e) {
+            // 忽略清理错误
+          }
+        }
+
+        ;(this as any)._startingStream = false
+        nodeLogger.info(`[${this.name}] ✅ API 事件流已连接 (享受心跳保护，不会超时)`)
+        return
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API 事件流启动失败: ${e.message}，降级到 SSH 命令`)
+      }
+    }
+
+    // === 方案 2: 降级使用 SSH 命令行 ===
+    // 只有 API 不可用时才走这里（可能因静默超时而频繁重连）
+    if (!this.connector) {
       ;(this as any)._startingStream = false
+      nodeLogger.warn(`[${this.name}] 无可用连接器，跳过事件流监听`)
       return
     }
 
-    ;(this as any)._activeStreamCount = (this as any)._activeStreamCount || 0
-    ;(this as any)._activeStreamCount++
-
-    nodeLogger.debug(`[${this.name}] 启动事件流 (活跃数: ${(this as any)._activeStreamCount})`)
+    nodeLogger.warn(`[${this.name}] 使用 SSH 命令模式监听事件流 (注意: 可能因长时间静默被防火墙切断)`)
 
     this.connector.startEventStream((line) => {
       this.handleEventLine(line)
     }).then((stop) => {
       ;(this as any)._eventStreamStop = stop
       ;(this as any)._startingStream = false
-      nodeLogger.debug(`[${this.name}] 事件流回调已注册`)
+      nodeLogger.info(`[${this.name}] ✅ SSH 事件流已连接 (注意: SSH模式下可能因静默超时而频繁重连)`)
     }).catch((err) => {
-      ;(this as any)._activeStreamCount--
       ;(this as any)._startingStream = false
-      nodeLogger.warn(`[${this.name}] 事件流启动失败: ${err.message}，5秒后重试`)
-      setTimeout(() => this.startEventStream(), 5000)
+      nodeLogger.error(`[${this.name}] ❌ SSH 事件流启动失败: ${err.message}`)
+      this.restartEventStream()
     })
+  }
+
+  /**
+   * 重启事件流
+   */
+  private restartEventStream(): void {
+    // 清理旧的流
+    if ((this as any)._eventStreamStop) {
+      try {
+        (this as any)._eventStreamStop()
+        ;(this as any)._eventStreamStop = null
+      } catch (e) {
+        // 忽略清理错误
+      }
+    }
+
+    // 重置启动标志
+    ;(this as any)._startingStream = false
+
+    // 5秒后重试
+    setTimeout(() => {
+      if (this.status === NodeStatus.CONNECTED) {
+        nodeLogger.info(`[${this.name}] 重新启动事件流...`)
+        this.startEventStream()
+      }
+    }, 5000)
   }
 
   /**
