@@ -3,7 +3,7 @@
  * 管理所有 Docker 节点
  */
 import { Context } from 'koishi'
-import type { DockerEvent, DockerControlConfig, ContainerInfo } from '../types'
+import type { DockerEvent, DockerControlConfig, ContainerInfo, NodeConfig } from '../types'
 import { DockerNode } from './node'
 import { logger } from '../utils/logger'
 import { PermissionManager } from './permission-manager'
@@ -31,6 +31,36 @@ export class DockerService {
   }
 
   /**
+   * 清理节点配置
+   */
+  private cleanNodeConfig(nodeConfig: NodeConfig): NodeConfig {
+    // 创建配置副本以避免修改原始配置
+    const cleaned = { ...nodeConfig }
+
+    // 验证并清理端口
+    if (typeof cleaned.port === 'string') {
+      const portStr = cleaned.port as string
+      if (portStr.includes('.') || portStr.includes(':')) {
+        logger.warn(`节点 ${cleaned.name} 检测到异常端口配置: "${portStr}"，已自动修正为 22`)
+        ;(cleaned as any).port = 22
+      } else {
+        const parsed = parseInt(portStr, 10)
+        if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
+          ;(cleaned as any).port = parsed
+        } else {
+          logger.error(`节点 ${cleaned.name} 端口值无效: "${portStr}"，已自动修正为 22`)
+          ;(cleaned as any).port = 22
+        }
+      }
+    } else if (typeof cleaned.port !== 'number' || cleaned.port < 1 || cleaned.port > 65535) {
+      logger.error(`节点 ${cleaned.name} 端口类型或值异常: ${cleaned.port}，已自动修正为 22`)
+      ;(cleaned as any).port = 22
+    }
+
+    return cleaned
+  }
+
+  /**
    * 初始化所有节点
    */
   async initialize(): Promise<void> {
@@ -47,7 +77,10 @@ export class DockerService {
         continue
       }
 
-      const node = new DockerNode(nodeConfig, credential, this.config.debug)
+      // 清理和验证端口配置
+      const cleanedNodeConfig = this.cleanNodeConfig(nodeConfig)
+
+      const node = new DockerNode(this.ctx, cleanedNodeConfig, credential, this.config.debug)
 
       // 【关键修复】创建节点时，立即绑定事件转发
       // 无论 index.ts 何时调用 onNodeEvent，这里都会把事件转发给 eventCallbacks

@@ -13,7 +13,31 @@ export class DockerConnector {
   constructor(
     private config: NodeConfig,
     private fullConfig: DockerControlConfig
-  ) { }
+  ) {
+    // 立即验证并修正配置
+    this.validateConfig()
+  }
+
+  /**
+   * 验证并修正配置
+   */
+  private validateConfig(): void {
+    if (typeof this.config.port === 'string') {
+      const portStr = this.config.port as string
+      if (portStr.includes('.') || portStr.includes(':')) {
+        connectorLogger.warn(`[${this.config.name}] 检测到异常端口配置: "${portStr}"，已自动修正为 22`)
+        ;(this.config as any).port = 22
+      } else {
+        const parsed = parseInt(portStr, 10)
+        if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
+          ;(this.config as any).port = parsed
+        } else {
+          connectorLogger.error(`[${this.config.name}] 端口值无效: "${portStr}"，已自动修正为 22`)
+          ;(this.config as any).port = 22
+        }
+      }
+    }
+  }
 
   /**
    * 执行 SSH 命令
@@ -311,9 +335,14 @@ export class DockerConnector {
         connectorLogger.debug(`[${this.config.name}] SSH Banner: ${msg.trim()}`)
       })
 
+      // 确保 port 是数字类型
+      const port = typeof this.config.port === 'string'
+        ? parseInt(this.config.port, 10)
+        : (this.config.port || 22)
+
       const connectConfig: ConnectConfig = {
         host: this.config.host,
-        port: this.config.port,
+        port: port,
         username: credential.username,
         readyTimeout: SSH_TIMEOUT,
         timeout: SSH_TIMEOUT,
@@ -412,5 +441,14 @@ export class DockerConnector {
     const escapedPath = filePath.replace(/"/g, '\\"')
     const result = await this.execWithExitCode(`test -f "${escapedPath}" && echo "exists" || echo "not exists"`)
     return result.output.trim() === 'exists'
+  }
+
+  /**
+   * 获取文件修改时间 (Unix 时间戳，秒)
+   */
+  async getFileModTime(filePath: string): Promise<number> {
+    const escapedPath = filePath.replace(/"/g, '\\"')
+    const output = await this.exec(`stat -c %Y "${escapedPath}" 2>/dev/null || echo "0"`)
+    return parseInt(output.trim(), 10)
   }
 }

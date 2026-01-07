@@ -20,8 +20,14 @@ export const MONITOR_RETRY_INTERVAL = 30000
 // Docker Events 监听间隔 (毫秒) - 已改为流式监听，此常量仅作备用
 export const EVENTS_POLL_INTERVAL = 60000
 
-// 容器状态轮询间隔 (毫秒) - 改为5分钟仅作兜底同步
+// 容器状态轮询间隔 (毫秒) - 仅在API降级时使用
 export const CONTAINER_POLL_INTERVAL = 5 * 60 * 1000
+
+// Docker API 健康检查间隔 (毫秒) - 定期检测API是否恢复
+export const API_HEALTH_CHECK_INTERVAL = 60 * 1000
+
+// 降级轮询间隔 (毫秒) - API不可用时的轮询频率
+export const DEGRADED_POLL_INTERVAL = 30 * 1000
 
 // 日志行数默认
 export const DEFAULT_LOG_LINES = 100

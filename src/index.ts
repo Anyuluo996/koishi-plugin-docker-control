@@ -64,6 +64,18 @@ interface AuditLogRecord {
   metadata: Record<string, any>
 }
 
+// Compose 文件缓存记录
+interface ComposeFileCache {
+  id: string
+  containerId: string
+  filePath: string
+  content: string
+  projectName: string
+  serviceCount: number
+  mtime: number
+  updatedAt: number
+}
+
 // Puppeteer 类型扩展
 declare module 'koishi' {
   interface Context {
@@ -79,6 +91,7 @@ declare module 'koishi' {
     'docker_control_subscriptions': DockerControlSubscription
     'docker_user_permissions': UserPermissionRecord
     'docker_audit_logs': AuditLogRecord
+    'docker_compose_cache': ComposeFileCache
   }
 }
 
@@ -119,6 +132,44 @@ export function apply(ctx: Context, config: DockerControlConfig) {
   if (!config) {
     logger.info('Docker Control 配置未定义，跳过加载')
     return
+  }
+
+  // 🔍 诊断：打印原始配置信息
+  logger.info('=== 配置诊断 ===')
+  logger.info(`配置中的节点数量: ${config.nodes?.length || 0}`)
+  if (config.nodes && config.nodes.length > 0) {
+    for (const node of config.nodes) {
+      logger.info(`节点 [${node.name}]:`)
+      logger.info(`  ID: ${node.id}`)
+      logger.info(`  Host: ${node.host}`)
+      logger.info(`  Port: ${node.port} (类型: ${typeof node.port})`)
+      logger.info(`  Credential: ${node.credentialId}`)
+    }
+  }
+  logger.info('================')
+
+  // 🔧 第一道防线：在插件入口处清理配置
+  if (config.nodes) {
+    for (const node of config.nodes) {
+      if (typeof node.port === 'string') {
+        const portStr = node.port as string
+        if (portStr.includes('.') || portStr.includes(':')) {
+          logger.warn(`[配置清理] 节点 ${node.name} 检测到异常端口: "${portStr}"，已修正为 22`)
+          ;(node as any).port = 22
+        } else {
+          const parsed = parseInt(portStr, 10)
+          if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
+            ;(node as any).port = parsed
+          } else {
+            logger.error(`[配置清理] 节点 ${node.name} 端口值无效: "${portStr}"，已修正为 22`)
+            ;(node as any).port = 22
+          }
+        }
+      } else if (typeof node.port !== 'number' || node.port < 1 || node.port > 65535) {
+        logger.error(`[配置清理] 节点 ${node.name} 端口异常: ${node.port} (${typeof node.port})，已修正为 22`)
+        ;(node as any).port = 22
+      }
+    }
   }
 
   // 验证配置

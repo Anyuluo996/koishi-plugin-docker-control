@@ -164,4 +164,120 @@ export function registerComposeCommand(
         return `获取 compose 配置失败: ${e.message}`
       }
     })
+
+  /**
+   * 更新 compose 缓存命令
+   */
+  ctx
+    .command('docker.compose.update <node> <container>', '手动更新 compose 文件缓存')
+    .alias('compose.update')
+    .action(async (_, nodeSelector, container) => {
+      const service = getService()
+      if (!service) {
+        return 'Docker 服务未初始化'
+      }
+
+      if (!nodeSelector || !container) {
+        return '请指定节点和容器: docker.compose.update <节点> <容器>'
+      }
+
+      // 获取节点
+      const nodes = service.getNodesBySelector(nodeSelector)
+      if (nodes.length === 0) {
+        return `未找到节点: ${nodeSelector}`
+      }
+
+      const node = nodes[0]
+
+      if (node.status !== 'connected') {
+        return `节点 ${node.name} 未连接`
+      }
+
+      // 查找容器
+      let containers
+      try {
+        containers = await node.listContainers(true)
+      } catch (e: any) {
+        return `获取容器列表失败: ${e.message}`
+      }
+
+      // 支持容器名称或 ID 前缀匹配
+      const targetContainer = containers.find(c =>
+        c.Names[0]?.replace('/', '') === container ||
+        c.Id.startsWith(container)
+      )
+
+      if (!targetContainer) {
+        return `未找到容器: ${container}`
+      }
+
+      // 更新缓存
+      const result = await node.updateComposeCache(targetContainer.Id)
+      return result.message
+    })
+
+  /**
+   * 清除 compose 缓存命令
+   */
+  ctx
+    .command('docker.compose.clear [node] [container]', '清除 compose 文件缓存')
+    .alias('compose.clear')
+    .action(async (_, nodeSelector, container) => {
+      const service = getService()
+      if (!service) {
+        return 'Docker 服务未初始化'
+      }
+
+      if (!nodeSelector) {
+        // 清除所有缓存
+        let totalCleared = 0
+        const nodes = service.getAllNodes()
+
+        for (const node of nodes) {
+          const result = await node.clearComposeCache()
+          totalCleared += result.cleared
+        }
+
+        return totalCleared > 0
+          ? `已清除所有节点的 compose 缓存 (共 ${totalCleared} 条)`
+          : '没有需要清除的缓存'
+      }
+
+      // 获取节点
+      const nodes = service.getNodesBySelector(nodeSelector)
+      if (nodes.length === 0) {
+        return `未找到节点: ${nodeSelector}`
+      }
+
+      const node = nodes[0]
+
+      if (!container) {
+        // 清除指定节点的所有缓存
+        const result = await node.clearComposeCache()
+        return result.message
+      }
+
+      // 查找容器
+      let containers
+      try {
+        containers = await node.listContainers(true)
+      } catch (e: any) {
+        return `获取容器列表失败: ${e.message}`
+      }
+
+      // 支持容器名称或 ID 前缀匹配
+      const targetContainer = containers.find(c =>
+        c.Names[0]?.replace('/', '') === container ||
+        c.Id.startsWith(container)
+      )
+
+      if (!targetContainer) {
+        return `未找到容器: ${container}`
+      }
+
+      // 清除指定容器的缓存
+      const result = await node.clearComposeCache(targetContainer.Id)
+      return result.message
+    })
 }
+

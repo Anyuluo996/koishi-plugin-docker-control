@@ -49,6 +49,48 @@ export function registerCommands(
  */
 function registerHelperCommands(ctx: Context, getService: GetService, config?: any): void {
   const useImageOutput = config?.imageOutput === true
+
+  /**
+   * 诊断：查看节点原始配置
+   */
+  ctx.command('docker.debug.config', '查看节点原始配置（诊断用）')
+    .action(async () => {
+      const service = getService()
+      if (!service) {
+        return 'Docker 服务未初始化'
+      }
+
+      const nodes = service.getAllNodes()
+      if (nodes.length === 0) {
+        return '未配置任何节点'
+      }
+
+      const lines: string[] = []
+      lines.push('=== 节点原始配置诊断 ===\n')
+
+      for (const node of nodes) {
+        const config = (node as any).config
+        lines.push(`【${config.name}】`)
+        lines.push(`  ID: ${config.id}`)
+        lines.push(`  Host: ${config.host}`)
+        lines.push(`  Port: ${config.port} (类型: ${typeof config.port})`)
+        lines.push(`  Credential: ${config.credentialId}`)
+        lines.push(`  Tags: ${config.tags.join(', ') || '(无)'}`)
+
+        // 检测异常
+        if (typeof config.port === 'string') {
+          if (config.port.includes('.') || config.port.includes(':')) {
+            lines.push(`  ⚠️  检测到异常端口配置: 包含IP地址或特殊字符`)
+          }
+        } else if (typeof config.port !== 'number') {
+          lines.push(`  ⚠️  检测到异常端口类型: ${typeof config.port}`)
+        }
+        lines.push('')
+      }
+
+      return lines.join('\n')
+    })
+
   /**
    * 查看节点列表
    */

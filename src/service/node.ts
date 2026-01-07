@@ -1,7 +1,7 @@
 /**
  * Docker 节点类 - 通过 SSH 执行 docker 命令
  */
-import { Random } from 'koishi'
+import { Random, Context } from 'koishi'
 import Dockerode, { DockerOptions, NetworkInspectInfo, ContainerInspectInfo } from 'dockerode'
 import type {
   NodeConfig,
@@ -12,9 +12,21 @@ import type {
   ComposeFileInfo,
   ContainerComposeInfo,
 } from '../types'
-import { NodeStatus, RETRY_INTERVAL, MAX_RETRY_COUNT, EVENTS_POLL_INTERVAL, CONTAINER_POLL_INTERVAL } from '../constants'
+import { NodeStatus, RETRY_INTERVAL, MAX_RETRY_COUNT, EVENTS_POLL_INTERVAL, CONTAINER_POLL_INTERVAL, API_HEALTH_CHECK_INTERVAL, DEGRADED_POLL_INTERVAL } from '../constants'
 import { DockerConnector } from './connector'
 import { nodeLogger } from '../utils/logger'
+
+// Compose 缓存数据库记录类型
+interface ComposeCacheRecord {
+  id: string
+  containerId: string
+  filePath: string
+  content: string
+  projectName: string
+  serviceCount: number
+  mtime: number
+  updatedAt: number
+}
 
 // 容器事件类型映射
 const CONTAINER_ACTIONS = ['start', 'stop', 'restart', 'die', 'create', 'destroy', 'pause', 'unpause', 'health_status']
@@ -24,6 +36,8 @@ export class DockerNode {
   public readonly config: NodeConfig
   /** 节点状态 */
   public status: NodeStatusType = NodeStatus.DISCONNECTED
+  /** Koishi Context (用于数据库操作) */
+  private readonly ctx: Context
   /** SSH 连接器 */
   private connector: DockerConnector | null = null
   /** Dockerode 实例 (用于 API 调用) */
@@ -34,6 +48,12 @@ export class DockerNode {
   private monitorTimer: NodeJS.Timeout | null = null
   /** 事件监控定时器 (docker events) */
   private eventTimer: NodeJS.Timeout | null = null
+  /** API健康检查定时器 */
+  private healthCheckTimer: NodeJS.Timeout | null = null
+  /** 降级轮询定时器 */
+  private degradedPollTimer: NodeJS.Timeout | null = null
+  /** 是否处于降级模式 */
+  private isDegradedMode = false
   /** 上次事件查询时间 */
   private lastEventTime: number = 0
   /** 上次容器状态快照 */
@@ -42,6 +62,7 @@ export class DockerNode {
   private eventCallbacks: Set<(event: DockerEvent) => void> = new Set()
   /** Debug 模式 */
   private debug = false
+
   /** 凭证配置 */
   private credential: CredentialConfig
   /** 用于事件去重: 记录 "ID:Action:Time" -> Timestamp */
@@ -49,10 +70,26 @@ export class DockerNode {
   /** [新增] 实例唯一标识，用于判断是否存在多实例冲突 */
   private instanceId = Random.id(4)
 
-  constructor(config: NodeConfig, credential: CredentialConfig, debug = false) {
+  constructor(ctx: Context, config: NodeConfig, credential: CredentialConfig, debug = false) {
+    this.ctx = ctx
     this.config = config
     this.credential = credential
     this.debug = debug
+
+    // 注册数据库表
+    this.ctx.model.extend('docker_compose_cache', {
+      id: 'string',
+      containerId: 'string',
+      filePath: 'string',
+      content: 'text',
+      projectName: 'string',
+      serviceCount: 'integer',
+      mtime: 'integer',
+      updatedAt: 'integer',
+    }, {
+      autoInc: false,
+      primary: 'id',
+    })
   }
 
   /**
@@ -64,6 +101,9 @@ export class DockerNode {
       nodeLogger.warn(`[${this.name}] 节点正在连接中，跳过`)
       return
     }
+
+    // 连接前先验证和清理配置
+    this.validateAndCleanConfig()
 
     this.status = NodeStatus.CONNECTING
     let attempt = 0
@@ -82,18 +122,21 @@ export class DockerNode {
       }
 
       try {
-        // 创建 connector
+        // 创建 connector（仅建立连接，不执行命令）
         const connector = new DockerConnector(this.config, { credentials: [this.credential], nodes: [this.config] } as any)
         this.connector = connector
 
-        // 测试 SSH 连接和 docker 命令
-        await connector.exec('docker version --format "{{.Server.Version}}"')
+        // 尝试初始化 Dockerode (优先使用 API)
+        await this.initDockerode()
+
+        // 如果 API 不可用，测试 SSH 连接和 docker 命令
+        if (!this.dockerApiAvailable) {
+          nodeLogger.debug(`[${this.name}] Docker API 不可用，测试 SSH docker 命令`)
+          await connector.exec('docker version --format "{{.Server.Version}}"')
+        }
 
         // 标记连接可用，允许事件流自动重连
         connector.setConnected(true)
-
-        // 初始化 Dockerode (用于 API 调用)
-        this.initDockerode()
 
         this.status = NodeStatus.CONNECTED
         nodeLogger.info(`[${this.name}] 连接成功 (SSH + ${this.dockerApiAvailable ? 'Docker API' : 'SSH 命令模式'})`)
@@ -124,6 +167,41 @@ export class DockerNode {
         nodeLogger.info(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
         await new Promise(resolve => setTimeout(resolve, currentInterval))
       }
+    }
+  }
+
+  /**
+   * 验证和清理配置
+   */
+  private validateAndCleanConfig(): void {
+    // 检查并修正端口配置
+    const originalPort = this.config.port
+    let cleanedPort: number | string = this.config.port
+
+    if (typeof this.config.port === 'string') {
+      const portStr = this.config.port as string
+      // 检测异常：端口包含 IP 地址或特殊字符
+      if (portStr.includes('.') || portStr.includes(':')) {
+        nodeLogger.warn(`[${this.name}] 检测到异常端口配置: "${portStr}"，已自动修正为 22`)
+        cleanedPort = 22
+      } else {
+        const parsed = parseInt(portStr, 10)
+        if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
+          nodeLogger.error(`[${this.name}] 端口值无效: "${portStr}"，已自动修正为 22`)
+          cleanedPort = 22
+        } else {
+          cleanedPort = parsed
+        }
+      }
+    } else if (typeof this.config.port !== 'number' || this.config.port < 1 || this.config.port > 65535) {
+      nodeLogger.error(`[${this.name}] 端口类型或值异常: ${this.config.port} (${typeof this.config.port})，已自动修正为 22`)
+      cleanedPort = 22
+    }
+
+    // 更新配置
+    if (cleanedPort !== originalPort) {
+      (this.config as any).port = cleanedPort
+      nodeLogger.info(`[${this.name}] 配置已修正: host="${this.config.host}", port=${cleanedPort}`)
     }
   }
 
@@ -164,16 +242,88 @@ export class DockerNode {
 
   /**
    * 执行容器内命令
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async execContainer(containerId: string, cmd: string): Promise<{ output: string; exitCode: number }> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 执行容器命令: ${containerId.slice(0, 12)} ${cmd}`)
+        const container = this.dockerode.getContainer(containerId)
+
+        // 创建 exec 实例
+        const exec = await container.exec({
+          Cmd: ['/bin/sh', '-c', cmd],
+          AttachStdout: true,
+          AttachStderr: true,
+        })
+
+        // 启动并获取输出
+        const stream = await exec.start({ Detach: false })
+
+        return new Promise((resolve, reject) => {
+          let output = ''
+          let errorOutput = ''
+
+          stream.on('data', (chunk: Buffer) => {
+            output += chunk.toString()
+          })
+
+          stream.on('error', (chunk: Buffer) => {
+            errorOutput += chunk.toString()
+          })
+
+          stream.on('end', async () => {
+            try {
+              const info = await exec.inspect()
+              resolve({
+                output: output || errorOutput,
+                exitCode: info.ExitCode || 0
+              })
+            } catch (e) {
+              reject(e)
+            }
+          })
+
+          stream.on('error', (err: any) => {
+            reject(err)
+          })
+        })
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API execContainer 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令执行容器命令: ${containerId.slice(0, 12)} ${cmd}`)
     if (!this.connector) throw new Error('未连接')
     return this.connector.execContainer(containerId, cmd)
   }
 
   /**
    * 获取 Docker 版本信息
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getVersion(): Promise<{ Version: string; ApiVersion: string; Os: string; Arch: string; KernelVersion: string }> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取版本信息`)
+        const info = await this.dockerode.version()
+        return {
+          Version: info.Version || 'unknown',
+          ApiVersion: info.ApiVersion || 'unknown',
+          Os: info.Os || 'unknown',
+          Arch: info.Arch || 'unknown',
+          KernelVersion: info.KernelVersion || 'unknown',
+        }
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API getVersion 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取版本信息`)
     if (!this.connector) throw new Error('未连接')
     const output = await this.connector.exec('docker version --format "{{json .Server}}"')
     const info = JSON.parse(output)
@@ -217,8 +367,26 @@ export class DockerNode {
 
   /**
    * 获取容器数量
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getContainerCount(): Promise<{ running: number; total: number }> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取容器数量`)
+        const allContainers = await this.dockerode.listContainers({ all: true })
+        const runningContainers = await this.dockerode.listContainers({ all: false })
+        return {
+          running: runningContainers.length,
+          total: allContainers.length,
+        }
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API getContainerCount 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取容器数量`)
     if (!this.connector) throw new Error('未连接')
     try {
       const running = await this.connector.exec('docker ps -q | wc -l')
@@ -234,8 +402,22 @@ export class DockerNode {
 
   /**
    * 获取镜像数量
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getImageCount(): Promise<number> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取镜像数量`)
+        const images = await this.dockerode.listImages()
+        return images.length
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API getImageCount 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取镜像数量`)
     if (!this.connector) throw new Error('未连接')
     try {
       const output = await this.connector.exec('docker images -q | wc -l')
@@ -247,6 +429,7 @@ export class DockerNode {
 
   /**
    * 获取镜像列表
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async listImages(): Promise<Array<{
     Id: string
@@ -255,6 +438,26 @@ export class DockerNode {
     Size: string
     Created: string
   }>> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取镜像列表`)
+        const images = await this.dockerode.listImages()
+
+        return images.map(img => ({
+          Id: img.Id || '',
+          Repository: img.RepoTags?.[0] || '<none>',
+          Tag: img.RepoTags?.[0]?.split(':')[1] || '<none>',
+          Size: img.Size ? formatBytes(img.Size) : '-',
+          Created: img.Created ? new Date(img.Created * 1000).toLocaleString() : '-',
+        }))
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API listImages 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取镜像列表`)
     if (!this.connector || this.status !== NodeStatus.CONNECTED) {
       throw new Error(`节点 ${this.name} 未连接`)
     }
@@ -280,6 +483,7 @@ export class DockerNode {
 
   /**
    * 获取网络列表
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async listNetworks(): Promise<Array<{
     Id: string
@@ -289,6 +493,45 @@ export class DockerNode {
     Subnet: string
     Gateway: string
   }>> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取网络列表`)
+        const networks = await this.dockerode.listNetworks()
+
+        const result = []
+        for (const net of networks) {
+          // 获取网络详细信息
+          let subnet = '-'
+          let gateway = '-'
+          try {
+            const details = await this.dockerode.getNetwork(net.Id!).inspect()
+            if (details.IPAM?.Config?.[0]) {
+              subnet = details.IPAM.Config[0].Subnet || '-'
+              gateway = details.IPAM.Config[0].Gateway || '-'
+            }
+          } catch (e) {
+            // 忽略 inspect 失败
+          }
+
+          result.push({
+            Id: net.Id || '',
+            Name: net.Name || '',
+            Driver: net.Driver || '-',
+            Scope: net.Scope || '-',
+            Subnet: subnet,
+            Gateway: gateway,
+          })
+        }
+
+        return result
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API listNetworks 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取网络列表`)
     if (!this.connector || this.status !== NodeStatus.CONNECTED) {
       throw new Error(`节点 ${this.name} 未连接`)
     }
@@ -343,6 +586,7 @@ export class DockerNode {
 
   /**
    * 获取存储卷列表
+   * 优先使用 Docker API (/system/df) 获取大小
    */
   async listVolumes(): Promise<Array<{
     Name: string
@@ -351,6 +595,30 @@ export class DockerNode {
     Mountpoint: string
     Size: string
   }>> {
+    // 方式 1: 尝试使用 Docker API (docker system df)
+    // 这是获取卷大小最准确、最原生的方式
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取卷列表 (docker system df)`)
+        const info = await this.dockerode.df()
+
+        const volumes = info.Volumes || []
+
+        return volumes.map((v: any) => ({
+          Name: v.Name || '',
+          Driver: v.Driver || 'local',
+          Scope: v.Scope || 'local',
+          Mountpoint: v.Mountpoint || '-',
+          // UsageData.Size 是字节数
+          Size: v.UsageData?.Size !== undefined ? formatBytes(v.UsageData.Size) : '-'
+        }))
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API listVolumes (df) 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取存储卷列表`)
     if (!this.connector || this.status !== NodeStatus.CONNECTED) {
       throw new Error(`节点 ${this.name} 未连接`)
     }
@@ -410,8 +678,42 @@ export class DockerNode {
   /**
    * 获取容器的 Docker Compose 信息
    * 通过标签 com.docker.compose.project.config_files 获取 compose 文件路径
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getContainerComposeInfo(containerId: string): Promise<ContainerComposeInfo | null> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取容器 compose 信息: ${containerId.slice(0, 12)}`)
+        const container = this.dockerode.getContainer(containerId)
+        const info = await container.inspect()
+
+        const labels = info.Config?.Labels as Record<string, string> | undefined
+        if (!labels) {
+          return null
+        }
+
+        // 获取 compose 项目名称和配置文件路径
+        const projectName = labels['com.docker.compose.project'] || ''
+        const configFiles = labels['com.docker.compose.project.config_files'] || ''
+
+        if (!projectName || !configFiles) {
+          return null
+        }
+
+        return {
+          containerId,
+          containerName: labels['com.docker.compose.container-number'] || '',
+          projectName,
+          composeFilePath: configFiles,
+        }
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API 获取 compose 信息失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取容器 compose 信息: ${containerId.slice(0, 12)}`)
     if (!this.connector) throw new Error('未连接')
 
     try {
@@ -445,7 +747,7 @@ export class DockerNode {
 
   /**
    * 获取容器的 Docker Compose 文件信息
-   * 读取并解析 compose 文件
+   * 优先从数据库读取缓存，未命中时才使用 SSH 读取并存储到数据库
    */
   async getComposeFileInfo(containerId: string): Promise<ComposeFileInfo | null> {
     if (!this.connector) throw new Error('未连接')
@@ -458,17 +760,52 @@ export class DockerNode {
 
       const filePath = composeInfo.composeFilePath
       const originalPath = filePath
+      const cacheId = `${containerId}:${filePath}`
 
-      // 尝试读取文件 (支持 Windows 路径自动转换)
+      // 从数据库查询缓存
+      const cached = await this.ctx.model.get('docker_compose_cache', cacheId)
+      const cachedRecord = Array.isArray(cached) ? cached[0] : cached
+
+      if (cachedRecord) {
+        nodeLogger.debug(`[${this.name}] 使用数据库缓存的 compose 文件: ${filePath}`)
+        return {
+          originalPath,
+          effectivePath: filePath,
+          usedWslPath: false,
+          content: cachedRecord.content,
+          projectName: cachedRecord.projectName,
+          serviceCount: cachedRecord.serviceCount,
+        }
+      }
+
+      // 数据库未命中，读取文件
+      nodeLogger.debug(`[${this.name}] 从 SSH 读取 compose 文件: ${filePath}`)
       const content = await this.connector.readFile(filePath)
 
       // 统计服务数量 (简单的 yaml 解析)
       const serviceCount = this.countServices(content)
 
+      // 获取文件修改时间
+      const mtime = await this.connector.getFileModTime(filePath)
+
+      // 存入数据库
+      await this.ctx.model.create('docker_compose_cache', {
+        id: cacheId,
+        containerId,
+        filePath,
+        content,
+        projectName: composeInfo.projectName,
+        serviceCount,
+        mtime,
+        updatedAt: Date.now(),
+      })
+
+      nodeLogger.debug(`[${this.name}] compose 文件已存入数据库: ${filePath}`)
+
       return {
         originalPath,
         effectivePath: filePath,
-        usedWslPath: false, // 实际是否使用了 WSL 路径在内部处理
+        usedWslPath: false,
         content,
         projectName: composeInfo.projectName,
         serviceCount,
@@ -476,6 +813,111 @@ export class DockerNode {
     } catch (e: any) {
       nodeLogger.warn(`[${this.name}] 获取 compose 文件信息失败: ${e.message}`)
       return null
+    }
+  }
+
+  /**
+   * 手动更新 compose 文件缓存
+   */
+  async updateComposeCache(containerId: string): Promise<{ success: boolean; message: string }> {
+    if (!this.connector) {
+      return { success: false, message: '节点未连接' }
+    }
+
+    try {
+      const composeInfo = await this.getContainerComposeInfo(containerId)
+      if (!composeInfo) {
+        return { success: false, message: '容器不是 compose 管理的' }
+      }
+
+      const filePath = composeInfo.composeFilePath
+      const cacheId = `${containerId}:${filePath}`
+
+      // 从 SSH 读取文件
+      const content = await this.connector.readFile(filePath)
+
+      // 统计服务数量
+      const serviceCount = this.countServices(content)
+
+      // 获取文件修改时间
+      const mtime = await this.connector.getFileModTime(filePath)
+
+      // 检查记录是否存在
+      const existing = await this.ctx.model.get('docker_compose_cache', cacheId)
+      const existingRecord = Array.isArray(existing) ? existing[0] : existing
+
+      if (existingRecord) {
+        // 更新现有记录
+        await this.ctx.model.set('docker_compose_cache', cacheId, {
+          content,
+          projectName: composeInfo.projectName,
+          serviceCount,
+          mtime,
+          updatedAt: Date.now(),
+        })
+      } else {
+        // 创建新记录
+        await this.ctx.model.create('docker_compose_cache', {
+          id: cacheId,
+          containerId,
+          filePath,
+          content,
+          projectName: composeInfo.projectName,
+          serviceCount,
+          mtime,
+          updatedAt: Date.now(),
+        })
+      }
+
+      nodeLogger.info(`[${this.name}] compose 缓存已更新: ${filePath}`)
+      return { success: true, message: `compose 文件已更新: ${filePath}` }
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 更新 compose 缓存失败: ${e.message}`)
+      return { success: false, message: `更新失败: ${e.message}` }
+    }
+  }
+
+  /**
+   * 清除 compose 文件缓存
+   */
+  async clearComposeCache(containerId?: string): Promise<{ cleared: number; message: string }> {
+    try {
+      if (containerId) {
+        // 清除特定容器的缓存
+        // 由于我们使用的是组合 ID (containerId:filePath)，需要先查询所有记录再筛选
+        const allRecords = await this.ctx.model.get('docker_compose_cache', {})
+        const recordsArray = Array.isArray(allRecords) ? allRecords : [allRecords].filter(Boolean)
+        const targetRecords = recordsArray.filter((r: ComposeCacheRecord) => r.containerId === containerId)
+
+        if (targetRecords.length === 0) {
+          return { cleared: 0, message: `未找到容器 ${containerId.slice(0, 12)} 的缓存` }
+        }
+
+        let cleared = 0
+        for (const record of targetRecords) {
+          await this.ctx.model.remove('docker_compose_cache', record.id)
+          cleared++
+        }
+
+        nodeLogger.debug(`[${this.name}] 已清除容器 ${containerId.slice(0, 12)} 的 ${cleared} 条 compose 缓存`)
+        return { cleared, message: `已清除容器 ${containerId.slice(0, 12)} 的 ${cleared} 条缓存` }
+      } else {
+        // 清除所有缓存（此节点的）
+        const allRecords = await this.ctx.model.get('docker_compose_cache', {})
+        const recordsArray = Array.isArray(allRecords) ? allRecords : [allRecords].filter(Boolean)
+        let cleared = 0
+
+        for (const record of recordsArray) {
+          await this.ctx.model.remove('docker_compose_cache', record.id)
+          cleared++
+        }
+
+        nodeLogger.debug(`[${this.name}] 已清除 ${cleared} 条 compose 缓存`)
+        return { cleared, message: `已清除 ${cleared} 条缓存` }
+      }
+    } catch (e: any) {
+      nodeLogger.error(`[${this.name}] 清除 compose 缓存失败: ${e.message}`)
+      return { cleared: 0, message: `清除失败: ${e.message}` }
     }
   }
 
@@ -491,8 +933,23 @@ export class DockerNode {
 
   /**
    * 获取容器详细信息 (docker inspect)
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getContainer(containerId: string): Promise<any> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取容器详情: ${containerId.slice(0, 12)}`)
+        const container = this.dockerode.getContainer(containerId)
+        const info = await container.inspect()
+        return info
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API inspect 失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取容器详情: ${containerId.slice(0, 12)}`)
     if (!this.connector) throw new Error('未连接')
     const output = await this.connector.exec(`docker inspect ${containerId}`)
     const info = JSON.parse(output)
@@ -910,7 +1367,7 @@ export class DockerNode {
    * 初始化 Dockerode
    * 根据配置决定连接本地 Socket 还是通过 SSH 连接远程
    */
-  private initDockerode(): void {
+  private async initDockerode(): Promise<void> {
     try {
       let dockerOptions: DockerOptions
 
@@ -925,19 +1382,26 @@ export class DockerNode {
       } else {
         // === 远程 SSH 连接配置 ===
 
-        // 1. 构建 ssh2 的连接参数
-        const sshOpts: any = {
-          host: this.config.host,
-          port: this.config.port || 22,
-          username: this.credential.username,
-          readyTimeout: 20000, // 连接超时
+        // 1. 确保端口是数字
+        let portNumber = 22
+        if (typeof this.config.port === 'number') {
+          portNumber = this.config.port
+        } else if (typeof this.config.port === 'string') {
+          const parsed = parseInt(this.config.port as string, 10)
+          if (!isNaN(parsed) && parsed > 0) portNumber = parsed
         }
 
-        // 2. 根据认证类型注入凭证
+        // 2. 准备 SSH 认证选项
+        // 关键点：将 port 放在这里，而不是顶层
+        const sshOpts: any = {
+          port: portNumber,
+          readyTimeout: 20000,
+        }
+
+        // 注入认证信息
         if (this.credential.authType === 'password' && this.credential.password) {
           sshOpts.password = this.credential.password
         } else if (this.credential.privateKey) {
-          // 关键：私钥通常需要去掉首尾多余空白，否则 ssh2 解析会失败
           sshOpts.privateKey = this.credential.privateKey.trim()
           if (this.credential.passphrase) {
             sshOpts.passphrase = this.credential.passphrase
@@ -945,27 +1409,31 @@ export class DockerNode {
         }
 
         // 3. 构建 Dockerode 配置
-        // 重点：必须使用 sshOptions 属性包裹 ssh 配置，否则 dockerode 可能无法正确透传凭证
+        // 核心修复：
+        // - 保留 host: 让 dockerode 知道是远程连接（解决"只获取本地容器"问题）
+        // - 移除 port: 避免 docker-modem 拼接 URL 时出错（解决 "Invalid port" 问题）
+        // - sshOptions: 包含 port 和认证信息，供底层 ssh2 使用
         dockerOptions = {
           protocol: 'ssh',
-          host: this.config.host,
-          port: this.config.port || 22,
-          username: this.credential.username,
-          sshOptions: sshOpts, // <--- 这里是修复的关键
+          host: this.config.host, // 必须保留
+          username: this.credential.username, // 必须保留
+          sshOptions: sshOpts, // 包含 port
         } as any
+
+        nodeLogger.info(`[${this.name}] 初始化 Docker API (SSH模式): host="${this.config.host}", port=${portNumber}`)
       }
 
       this.dockerode = new Dockerode(dockerOptions)
 
-      // 测试连接是否真正可用
-      this.dockerode.ping().then(() => {
+      // 测试连接
+      try {
+        await this.dockerode.ping()
         this.dockerApiAvailable = true
-        nodeLogger.debug(`[${this.name}] Docker API 连接成功 (${isLocal ? 'Local' : 'SSH'})`)
-      }).catch((e: any) => {
+        nodeLogger.info(`[${this.name}] Docker API 连接成功 (${isLocal ? 'Local' : 'SSH'})`)
+      } catch (e: any) {
         this.dockerApiAvailable = false
-        // 详细记录错误原因，方便排查
         nodeLogger.warn(`[${this.name}] Docker API 连接失败: ${e.message} (将降级使用 SSH 命令)`)
-      })
+      }
     } catch (e) {
       this.dockerode = null
       this.dockerApiAvailable = false
@@ -980,10 +1448,17 @@ export class DockerNode {
     // 方式 1: 尝试使用 Docker API
     if (this.dockerode && this.dockerApiAvailable) {
       try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取容器列表 (all=${all})`)
         const containers = await this.dockerode.listContainers({ all })
+        nodeLogger.debug(`[${this.name}] Docker API 返回 ${containers.length} 个容器`)
+
+        // 详细日志：记录前几个容器的信息
+        if (containers.length > 0) {
+          nodeLogger.debug(`[${this.name}] 容器列表示例: ${containers.slice(0, 2).map(c => c.Names[0]).join(', ')}`)
+        }
 
         // 转换 Dockerode 的返回格式
-        return containers.map(c => ({
+        const result = containers.map(c => ({
           Id: c.Id,
           Names: c.Names,
           Image: c.Image,
@@ -997,17 +1472,23 @@ export class DockerNode {
           HostConfig: { NetworkMode: (c.HostConfig as any)?.NetworkMode || '' },
           NetworkSettings: { Networks: (c.NetworkSettings as any)?.Networks || {} },
         }))
+
+        nodeLogger.debug(`[${this.name}] 转换后返回 ${result.length} 个容器`)
+        return result
       } catch (e: any) {
         nodeLogger.warn(`[${this.name}] API listContainers 失败，降级到 SSH: ${e.message}`)
       }
     }
 
     // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取容器列表`)
     if (!this.connector || this.status !== NodeStatus.CONNECTED) {
       throw new Error(`节点 ${this.name} 未连接`)
     }
     const output = await this.connector.listContainers(all)
-    return this.parseContainerList(output)
+    const parsed = this.parseContainerList(output)
+    nodeLogger.debug(`[${this.name}] SSH 返回 ${parsed.length} 个容器`)
+    return parsed
   }
 
   /**
@@ -1280,8 +1761,39 @@ export class DockerNode {
 
   /**
    * 获取容器端口映射
+   * 优先使用 Docker API，失败时降级到 SSH 命令
    */
   async getContainerPorts(containerId: string): Promise<string[]> {
+    // 方式 1: 尝试使用 Docker API
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        nodeLogger.debug(`[${this.name}] 使用 Docker API 获取容器端口: ${containerId.slice(0, 12)}`)
+        const container = this.dockerode.getContainer(containerId)
+        const info = await container.inspect()
+
+        const portBindings = info.HostConfig.PortBindings
+        if (!portBindings) return []
+
+        const portStrings: string[] = []
+        for (const [containerPort, bindings] of Object.entries(portBindings)) {
+          const bindingArray = bindings as Array<{HostIp: string; HostPort: string}> | undefined
+          if (bindingArray && bindingArray.length > 0) {
+            for (const binding of bindingArray) {
+              const hostIp = binding.HostIp || '0.0.0.0'
+              const hostPort = binding.HostPort
+              portStrings.push(`${hostIp}:${hostPort} -> ${containerPort}`)
+            }
+          }
+        }
+
+        return portStrings
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] API 获取端口失败，降级到 SSH: ${e.message}`)
+      }
+    }
+
+    // 方式 2: SSH 命令行回退
+    nodeLogger.debug(`[${this.name}] 使用 SSH 命令获取容器端口: ${containerId.slice(0, 12)}`)
     if (!this.connector) return []
 
     try {
@@ -1362,20 +1874,116 @@ export class DockerNode {
     // 事件流监听：使用 docker events 流式获取
     this.startEventStream()
 
-    // 状态监控：每 60 秒检查容器状态并检测变更
-    // (用于捕获可能遗漏的状态变化，以及启动时的初始状态)
-    this.monitorTimer = setInterval(async () => {
-      if (this.status !== NodeStatus.CONNECTED) return
+    // 启动API健康检查
+    this.startHealthCheck()
 
-      try {
-        const containers = await this.listContainers(true)
-        this.checkContainerStateChanges(containers)
-      } catch (e) {
-        nodeLogger.warn(`[${this.name}] 监控失败: ${e}`)
+    nodeLogger.info(`[${this.name}] 监控已启动 (事件流 + API健康检查)`)
+  }
+
+  /**
+   * 启动 API 健康检查
+   */
+  private startHealthCheck(): void {
+    // 立即检查一次
+    this.checkApiHealth()
+
+    // 定期检查API健康状态
+    this.healthCheckTimer = setInterval(async () => {
+      await this.checkApiHealth()
+    }, API_HEALTH_CHECK_INTERVAL)
+
+    nodeLogger.debug(`[${this.name}] API健康检查已启动 (间隔: ${API_HEALTH_CHECK_INTERVAL / 1000}秒)`)
+  }
+
+  /**
+   * 检查 Docker API 健康状态
+   */
+  private async checkApiHealth(): Promise<void> {
+    // 如果已经处于降级模式，尝试恢复
+    if (this.isDegradedMode) {
+      if (this.dockerode) {
+        try {
+          await this.dockerode.ping()
+          nodeLogger.info(`[${this.name}] Docker API 已恢复，停止降级轮询`)
+          this.dockerApiAvailable = true
+          this.stopDegradedPolling()
+        } catch (e) {
+          nodeLogger.debug(`[${this.name}] Docker API 尚未恢复，继续降级模式`)
+        }
       }
-    }, CONTAINER_POLL_INTERVAL)
+      return
+    }
 
-    nodeLogger.info(`[${this.name}] 监控已启动 (事件流 + 每 ${CONTAINER_POLL_INTERVAL / 1000} 秒状态检查)`)
+    // 如果不在降级模式，检查API是否失败
+    if (this.dockerode && this.dockerApiAvailable) {
+      try {
+        await this.dockerode.ping()
+        // API健康，无需操作
+      } catch (e: any) {
+        nodeLogger.warn(`[${this.name}] Docker API 健康检查失败: ${e.message}，启动降级轮询`)
+        this.dockerApiAvailable = false
+        this.startDegradedPolling()
+      }
+    } else if (!this.dockerApiAvailable && !this.isDegradedMode) {
+      // API不可用且未启动降级轮询，启动降级
+      nodeLogger.warn(`[${this.name}] Docker API 不可用，启动降级轮询`)
+      this.startDegradedPolling()
+    }
+  }
+
+  /**
+   * 启动降级轮询 (当API不可用时)
+   */
+  private startDegradedPolling(): void {
+    if (this.isDegradedMode) {
+      nodeLogger.debug(`[${this.name}] 已处于降级模式，跳过`)
+      return
+    }
+
+    this.isDegradedMode = true
+
+    // 立即执行一次轮询
+    this.pollContainerStates()
+
+    // 定期轮询容器状态
+    this.degradedPollTimer = setInterval(async () => {
+      await this.pollContainerStates()
+    }, DEGRADED_POLL_INTERVAL)
+
+    nodeLogger.info(`[${this.name}] 降级轮询已启动 (间隔: ${DEGRADED_POLL_INTERVAL / 1000}秒)`)
+  }
+
+  /**
+   * 停止降级轮询
+   */
+  private stopDegradedPolling(): void {
+    if (!this.isDegradedMode) {
+      return
+    }
+
+    this.isDegradedMode = false
+
+    if (this.degradedPollTimer) {
+      clearInterval(this.degradedPollTimer)
+      this.degradedPollTimer = null
+    }
+
+    nodeLogger.info(`[${this.name}] 降级轮询已停止，恢复Docker API模式`)
+  }
+
+  /**
+   * 轮询容器状态 (用于降级模式)
+   */
+  private async pollContainerStates(): Promise<void> {
+    if (this.status !== NodeStatus.CONNECTED) return
+
+    try {
+      const containers = await this.listContainers(true)
+      this.checkContainerStateChanges(containers)
+      nodeLogger.debug(`[${this.name}] 降级轮询: 检查了 ${containers.length} 个容器`)
+    } catch (e) {
+      nodeLogger.warn(`[${this.name}] 降级轮询失败: ${e}`)
+    }
   }
 
   /**
@@ -1616,6 +2224,13 @@ export class DockerNode {
       clearInterval(this.monitorTimer)
       this.monitorTimer = null
     }
+    // 停止健康检查
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer)
+      this.healthCheckTimer = null
+    }
+    // 停止降级轮询
+    this.stopDegradedPolling()
     // 停止事件流
     if ((this as any)._eventStreamStop) {
       ;(this as any)._eventStreamStop()
@@ -1668,6 +2283,14 @@ export class DockerNode {
     if (this.eventTimer) {
       clearInterval(this.eventTimer)
       this.eventTimer = null
+    }
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer)
+      this.healthCheckTimer = null
+    }
+    if (this.degradedPollTimer) {
+      clearInterval(this.degradedPollTimer)
+      this.degradedPollTimer = null
     }
   }
 
