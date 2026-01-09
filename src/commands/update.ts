@@ -77,7 +77,17 @@ export function registerUpdateCommands(
       await session?.send(`🚀 开始更新流程: ${containerName}`)
 
       try {
-        // 1. 备份 (如果指定了 -b)
+        // 1. 检查镜像是否有更新
+        await session?.send(`🔍 正在检查镜像更新...`)
+        const checkResult = await node.checkImageUpdate(target.Id)
+
+        if (!checkResult.hasUpdate) {
+          return `⚪ 当前已是最新版本\n当前镜像 ID: ${checkResult.currentId.slice(0, 12)}`
+        }
+
+        await session?.send(`🟢 发现新版本！\n当前: ${checkResult.currentId.slice(0, 12)}\n最新: ${checkResult.remoteId.slice(0, 12)}`)
+
+        // 2. 备份 (如果指定了 -b)
         if (options?.backup) {
           await session?.send(`📦 正在备份...`)
           const backupResult = await node.backupContainer(target.Id)
@@ -88,17 +98,22 @@ export function registerUpdateCommands(
           }
         }
 
-        // 2. 拉取最新镜像
-        await session?.send(`⬇️ 正在检查并拉取最新镜像...`)
-        const pullResult = await node.pullImage(target.Image)
-        await session?.send(pullResult.pulled ? `✅ ${pullResult.reason}` : `⏭️ ${pullResult.reason}`)
+        // 3. 拉取最新镜像（此时镜像已经在 checkImageUpdate 中拉取完成）
+        await session?.send(`✅ 镜像已就绪，开始更新容器...`)
 
-        // 3. 重建容器
+        // 4. 重建容器
         await session?.send(`🔄 正在重建容器...`)
         const result = await node.recreateContainer(target.Id, {}, true)
 
         if (result.success) {
-          return `✅ 更新成功! 新容器 ID: ${result.newId?.slice(0, 12)}`
+          const messages = [
+            `✅ 更新成功!`,
+            `新容器 ID: ${result.newId?.slice(0, 12)}`,
+            ``,
+            `📦 旧容器已保留: ${result.oldContainerName}`,
+            `💡 请手动检查并删除旧容器: docker rm ${result.oldContainerName}`
+          ]
+          return messages.join('\n')
         } else {
           return `❌ 更新失败: ${result.error}`
         }
@@ -147,7 +162,14 @@ export function registerUpdateCommands(
         })
 
         if (result.success) {
-          return `✅ 修改成功! 新容器 ID: ${result.newId?.slice(0, 12)}`
+          const messages = [
+            `✅ 修改成功!`,
+            `新容器 ID: ${result.newId?.slice(0, 12)}`,
+            ``,
+            `📦 旧容器已保留: ${result.oldContainerName}`,
+            `💡 请手动检查并删除旧容器: docker rm ${result.oldContainerName}`
+          ]
+          return messages.join('\n')
         } else {
           return `❌ 修改失败: ${result.error}`
         }

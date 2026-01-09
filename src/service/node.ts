@@ -1137,13 +1137,13 @@ export class DockerNode {
 
   /**
    * 重建/更新容器
-   * 流程：重命名旧容器 -> 创建新容器 -> 启动新容器 -> 停止并删除旧容器
+   * 流程：停止旧容器 -> 重命名旧容器 -> 创建新容器 -> 启动新容器 -> 保留旧容器供手动清理
    */
   async recreateContainer(
     containerId: string,
     options: { env?: string[]; portBindings?: Record<string, any> } = {},
     updateImage = false
-  ): Promise<{ success: boolean; newId?: string; error?: string }> {
+  ): Promise<{ success: boolean; newId?: string; oldContainerName?: string; error?: string }> {
     if (!this.dockerode || !this.dockerApiAvailable) throw new Error('API 不可用')
 
     const container = this.dockerode.getContainer(containerId)
@@ -1179,18 +1179,30 @@ export class DockerNode {
       newEnv = Array.from(envMap.values())
     }
 
-    // 2. 重命名旧容器（保持运行状态，以便回滚）
-    const tempName = `${containerName}_old_${Random.id(4)}`
+    // 2. 停止旧容器
     try {
-      await container.rename({ name: tempName })
+      nodeLogger.debug(`[${this.name}] 正在停止旧容器 ${containerName}...`)
+      await container.stop({ t: 10 }) // 给10秒优雅停止时间
+    } catch (e: any) {
+      nodeLogger.warn(`[${this.name}] 停止旧容器失败: ${e.message}`)
+    }
+
+    // 3. 重命名旧容器（保留供手动清理）
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const oldContainerName = `${containerName}_old_${timestamp}`
+    try {
+      await container.rename({ name: oldContainerName })
+      nodeLogger.info(`[${this.name}] 旧容器已重命名为: ${oldContainerName}`)
     } catch (e: any) {
       nodeLogger.warn(`[${this.name}] 重命名容器失败: ${e.message}`)
+      // 如果重命名失败，使用默认名称
+      const oldContainerName = `${containerName}_old_${Random.id(4)}`
     }
 
     let newContainerId: string | undefined
 
     try {
-      // 3. 创建新容器
+      // 4. 创建新容器
       const createOptions = {
         name: containerName,
         Image: imageToUse,
@@ -1208,35 +1220,18 @@ export class DockerNode {
         }
       }
 
+      nodeLogger.debug(`[${this.name}] 正在创建新容器 ${containerName}...`)
       const newContainer = await this.dockerode.createContainer(createOptions)
       newContainerId = newContainer.id
 
-      // 4. 启动新容器
+      // 5. 启动新容器
+      nodeLogger.debug(`[${this.name}] 正在启动新容器 ${containerName}...`)
       await newContainer.start()
 
-      // 5. 新容器成功运行，停止并删除旧容器
-      const oldContainer = this.dockerode.getContainer(originalContainerId)
-      try {
-        // 尝试停止旧容器
-        await oldContainer.stop({ t: 0 })
-      } catch (e: any) {
-        // 如果已经停止或不存在，忽略错误
-        if (!e.message.includes('already stopped') && !e.message.includes('No such container')) {
-          nodeLogger.warn(`[${this.name}] 停止旧容器失败: ${e.message}`)
-        }
-      }
+      nodeLogger.info(`[${this.name}] ✅ 容器更新成功！新容器 ID: ${newContainerId.slice(0, 12)}`)
+      nodeLogger.info(`[${this.name}] 📦 旧容器已保留: ${oldContainerName}，请手动删除`)
 
-      try {
-        // 删除旧容器
-        await oldContainer.remove({ force: true })
-      } catch (e: any) {
-        // 如果已经删除，忽略错误
-        if (!e.message.includes('No such container')) {
-          nodeLogger.warn(`[${this.name}] 删除旧容器失败: ${e.message}`)
-        }
-      }
-
-      return { success: true, newId: newContainerId }
+      return { success: true, newId: newContainerId, oldContainerName }
 
     } catch (e: any) {
       nodeLogger.error(`[${this.name}] 重建容器失败，尝试回滚: ${e.message}`)
@@ -1248,6 +1243,7 @@ export class DockerNode {
           try {
             const failedNewContainer = this.dockerode.getContainer(newContainerId)
             await failedNewContainer.remove({ force: true })
+            nodeLogger.debug(`[${this.name}] 已删除失败的新容器`)
           } catch (removeError: any) {
             nodeLogger.warn(`[${this.name}] 删除失败的新容器时出错: ${removeError.message}`)
           }
@@ -1256,11 +1252,13 @@ export class DockerNode {
         // 重命名旧容器回原名称
         const oldContainer = this.dockerode.getContainer(originalContainerId)
         await oldContainer.rename({ name: containerName })
+        nodeLogger.debug(`[${this.name}] 已将旧容器重命名回 ${containerName}`)
 
         // 如果旧容器原本是运行状态，尝试启动
         if (wasRunning) {
           try {
             await oldContainer.start()
+            nodeLogger.info(`[${this.name}] ✅ 回滚成功，旧容器已恢复运行`)
           } catch (startError: any) {
             // 启动失败，可能是因为容器已经停止
             nodeLogger.warn(`[${this.name}] 启动旧容器失败: ${startError.message}`)
@@ -1269,6 +1267,7 @@ export class DockerNode {
 
         return { success: false, error: `更新失败，已回滚: ${e.message}` }
       } catch (rollbackError: any) {
+        nodeLogger.error(`[${this.name}] 回滚失败: ${rollbackError.message}`)
         return { success: false, error: `更新失败且回滚失败(需人工干预): ${e.message} -> ${rollbackError.message}` }
       }
     }
