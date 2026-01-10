@@ -13,10 +13,17 @@ import { checkPermission } from '../utils/permission-check'
  */
 function formatNet(bytes: string): string {
   const num = parseFloat(bytes)
-  if (isNaN(num)) return '-'
-  if (num < 1024) return bytes + 'B'
-  if (num < 1024 * 1024) return (num / 1024).toFixed(1) + 'KB'
-  return (num / 1024 / 1024).toFixed(2) + 'MB'
+
+  if (isNaN(num)) {
+    // 如果无法解析为数字，可能已经包含单位，直接返回
+    return bytes
+  }
+
+  if (num === 0) return '0B'
+  if (num < 1024) return num.toFixed(0) + 'B'
+  if (num < 1024 * 1024) return (num / 1024).toFixed(2) + 'KB'
+  if (num < 1024 * 1024 * 1024) return (num / 1024 / 1024).toFixed(2) + 'MB'
+  return (num / 1024 / 1024 / 1024).toFixed(2) + 'GB'
 }
 
 /**
@@ -359,7 +366,8 @@ export function registerControlCommands(
           lines.push('性能监控:')
           lines.push(`  CPU: ${stats.cpuPercent}`)
           lines.push(`  内存: ${stats.memoryPercent} (${stats.memoryUsage} / ${stats.memoryLimit})`)
-          lines.push(`  网络: ${formatNet(stats.networkIn)} / ${formatNet(stats.networkOut)}`)
+          lines.push(`  网络 ↓: ${formatNet(stats.networkIn)}`)
+          lines.push(`  网络 ↑: ${formatNet(stats.networkOut)}`)
           lines.push(`  进程: ${stats.pids}`)
         }
 
