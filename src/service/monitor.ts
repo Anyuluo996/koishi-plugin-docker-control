@@ -14,6 +14,8 @@ interface ContainerState {
   history: number[]
   // 上次启动时间，用于屏蔽紧随其后的 restart 事件
   lastStartTime?: number
+  // 容器名称：用于容器更新时跨容器ID追踪
+  containerName?: string
 }
 
 // 处理后的事件数据结构
@@ -30,6 +32,8 @@ export interface ProcessedEvent {
 export class MonitorManager {
   /** 容器状态映射: nodeId -> containerId -> State */
   private states: Map<string, Map<string, ContainerState>> = new Map()
+  /** 容器名称映射: nodeId -> containerName -> containerId，用于容器更新时跨容器ID追踪 */
+  private nameIndex: Map<string, Map<string, string>> = new Map()
   /** 全局回调 */
   private callback?: (event: ProcessedEvent) => void
 
@@ -54,8 +58,8 @@ export class MonitorManager {
     const containerId = event.Actor.ID
     const containerName = event.Actor.Attributes?.name || 'unknown'
 
-    // 获取容器状态存储
-    const state = this.getContainerState(node.id, containerId)
+    // 获取容器状态存储（同时更新名称索引）
+    const state = this.getContainerState(node.id, containerId, containerName)
     const now = Date.now()
 
     // ---------------------------------------------------------
@@ -115,6 +119,8 @@ export class MonitorManager {
 
       state.stopTimer = setTimeout(() => {
         state.stopTimer = undefined
+        // 清理名称索引
+        this.clearNameIndex(node.id, containerName)
         // 只有定时器真正走完了，才发送通知
         this.emit({
           eventType: `container.die`, // 统一使用 die
@@ -130,6 +136,19 @@ export class MonitorManager {
     } else if (action === 'start' || action === 'restart') {
       // [关键] 记录启动时间，用于屏蔽后续的 restart
       state.lastStartTime = now
+
+      // [新功能] 检查是否有同名的旧容器正在等待防抖
+      const oldContainerId = this.getContainerIdByName(node.id, containerName)
+      if (oldContainerId && oldContainerId !== containerId) {
+        const oldState = this.getContainerStateById(node.id, oldContainerId)
+        if (oldState?.stopTimer) {
+          clearTimeout(oldState.stopTimer)
+          oldState.stopTimer = undefined
+          monitorLogger.info(`[${node.name}] ${containerName} 容器更新：取消旧容器 ${oldContainerId.slice(0, 12)} 的退出通知`)
+          // 清理旧容器的状态
+          this.removeContainerState(node.id, oldContainerId)
+        }
+      }
 
       if (state.stopTimer) {
         // 在防抖时间内恢复：取消报警
@@ -165,7 +184,7 @@ export class MonitorManager {
     }
   }
 
-  private getContainerState(nodeId: string, containerId: string): ContainerState {
+  private getContainerState(nodeId: string, containerId: string, containerName?: string): ContainerState {
     if (!this.states.has(nodeId)) {
       this.states.set(nodeId, new Map())
     }
@@ -173,10 +192,53 @@ export class MonitorManager {
 
     if (!nodeStates.has(containerId)) {
       nodeStates.set(containerId, {
-        history: []
+        history: [],
+        containerName
       })
     }
-    return nodeStates.get(containerId)!
+    const state = nodeStates.get(containerId)!
+
+    // 更新名称索引
+    if (containerName) {
+      if (!this.nameIndex.has(nodeId)) {
+        this.nameIndex.set(nodeId, new Map())
+      }
+      this.nameIndex.get(nodeId)!.set(containerName, containerId)
+      state.containerName = containerName
+    }
+
+    return state
+  }
+
+  private getContainerStateById(nodeId: string, containerId: string): ContainerState | undefined {
+    const nodeStates = this.states.get(nodeId)
+    return nodeStates?.get(containerId)
+  }
+
+  private getContainerIdByName(nodeId: string, containerName: string): string | undefined {
+    const nameMap = this.nameIndex.get(nodeId)
+    return nameMap?.get(containerName)
+  }
+
+  private removeContainerState(nodeId: string, containerId: string): void {
+    const nodeStates = this.states.get(nodeId)
+    if (nodeStates) {
+      const state = nodeStates.get(containerId)
+      if (state?.containerName) {
+        const nameMap = this.nameIndex.get(nodeId)
+        if (nameMap?.get(state.containerName) === containerId) {
+          nameMap.delete(state.containerName)
+        }
+      }
+      nodeStates.delete(containerId)
+    }
+  }
+
+  private clearNameIndex(nodeId: string, containerName: string): void {
+    const nameMap = this.nameIndex.get(nodeId)
+    if (nameMap) {
+      nameMap.delete(containerName)
+    }
   }
 
   private cleanHistory(state: ContainerState, now: number) {
