@@ -45,6 +45,7 @@ export type NotificationEventType =
   | 'container.stop'
   | 'container.restart'
   | 'container.die'
+  | 'container.upgraded'
   | 'container.health_status'
   | 'node.online'
   | 'node.offline'

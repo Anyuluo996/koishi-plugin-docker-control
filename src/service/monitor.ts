@@ -20,8 +20,8 @@ interface ContainerState {
 
 // 处理后的事件数据结构
 export interface ProcessedEvent {
-  eventType: string // 'container.start', 'container.flapping'
-  action: string    // 'start', 'stop', 'die', 'flapping'
+  eventType: string // 'container.start', 'container.flapping', 'container.upgraded'
+  action: string    // 'start', 'stop', 'die', 'flapping', 'upgraded'
   nodeId: string
   nodeName: string
   containerId: string
@@ -115,22 +115,42 @@ export class MonitorManager {
         return
       }
 
-      monitorLogger.debug(`[${node.name}] ${containerName} 已停止 (${action})，等待 ${debounceWait}ms...`)
+      monitorLogger.debug(`[${node.name}] ${containerName} 已停止 (${action})，等待 ${debounceWait}ms 后检查容器状态...`)
 
-      state.stopTimer = setTimeout(() => {
+      state.stopTimer = setTimeout(async () => {
         state.stopTimer = undefined
+
+        // 检查是否有同名容器正在运行（容器升级场景）
+        const hasRunningContainer = await checkIfContainerRunning(node, containerName)
+
+        if (hasRunningContainer) {
+          // 有同名容器正在运行，说明是容器升级
+          monitorLogger.info(`[${node.name}] ${containerName} 容器升级：检测到同名容器正在运行`)
+          this.emit({
+            eventType: 'container.upgraded',
+            action: 'upgraded',
+            nodeId: node.id,
+            nodeName: node.name,
+            containerId,
+            containerName,
+            timestamp: Date.now()
+          })
+        } else {
+          // 没有同名容器运行，说明是真正的异常退出
+          monitorLogger.info(`[${node.name}] ${containerName} 容器异常退出：未检测到同名容器运行`)
+          this.emit({
+            eventType: `container.die`, // 统一使用 die
+            action: 'die',
+            nodeId: node.id,
+            nodeName: node.name,
+            containerId,
+            containerName,
+            timestamp: Date.now()
+          })
+        }
+
         // 清理名称索引
         this.clearNameIndex(node.id, containerName)
-        // 只有定时器真正走完了，才发送通知
-        this.emit({
-          eventType: `container.die`, // 统一使用 die
-          action: 'die',
-          nodeId: node.id,
-          nodeName: node.name,
-          containerId,
-          containerName,
-          timestamp: Date.now()
-        })
       }, debounceWait)
 
     } else if (action === 'start' || action === 'restart') {
@@ -245,5 +265,25 @@ export class MonitorManager {
     const window = this.config.flappingWindow || 300000 // 默认 5分钟
     // 移除超出时间窗口的记录
     state.history = state.history.filter(t => now - t <= window)
+  }
+}
+
+/**
+ * 检查节点上是否有指定名称的容器正在运行
+ * @param node Docker 节点
+ * @param containerName 容器名称
+ * @returns 是否有同名容器正在运行
+ */
+async function checkIfContainerRunning(node: DockerNode, containerName: string): Promise<boolean> {
+  try {
+    // 只检查运行中的容器
+    const containers = await node.listContainers(false)
+    // 检查是否有同名容器（容器名称格式可能为 /name 或 name）
+    return containers.some(c =>
+      c.Names.some(n => n === `/${containerName}` || n === containerName)
+    )
+  } catch (e) {
+    monitorLogger.warn(`[${node.name}] 检查容器运行状态失败: ${e}`)
+    return false
   }
 }

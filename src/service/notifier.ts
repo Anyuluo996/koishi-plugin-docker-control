@@ -18,6 +18,7 @@ const EVENT_TEMPLATES: Record<string, string> = {
   'container.stop': '容器已停止',
   'container.restart': '容器已重启',
   'container.die': '容器已异常退出',
+  'container.upgraded': '容器已升级',
   'container.create': '容器已创建',
   'container.destroy': '容器已销毁',
   // 健康检查
@@ -60,6 +61,7 @@ const EVENT_LEVEL: Record<string, 'info' | 'warning' | 'error'> = {
   'container.stop': 'info',
   'container.restart': 'info',
   'container.die': 'error',
+  'container.upgraded': 'info',
   'container.health_status': 'warning',
   'node.online': 'info',
   'node.offline': 'warning',
