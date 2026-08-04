@@ -54,8 +54,13 @@ export class ReconnectManager {
 
     nodeLogger.info(`[重连] 节点 ${nodeId} 尝试重连 (${attempts + 1}/${this.config.maxAttempts})，${backoff}ms 后开始`)
 
-    // 等待退避时间
-    await new Promise((resolve) => setTimeout(resolve, backoff))
+    // 等待退避时间（每 500ms 检查一次是否已被取消，避免在已废弃节点上浪费时间）
+    const cancelled = await this.sleepOrCancel(backoff, nodeId)
+    if (cancelled) {
+      nodeLogger.info(`[重连] 节点 ${nodeId} 已被取消/废弃，停止重连`)
+      this.reconnecting.delete(nodeId)
+      return
+    }
 
     try {
       await node.reconnect()
@@ -68,8 +73,12 @@ export class ReconnectManager {
     } catch (error) {
       nodeLogger.warn(`[重连] 节点 ${nodeId} 重连失败: ${error.message}`)
 
-      // 计划下次重试
+      // 计划下次重试（同样检查节点是否已被取消）
       const timer = setTimeout(async () => {
+        if (!this.reconnectAttempts.has(nodeId)) {
+          // 节点已被取消
+          return
+        }
         try {
           await this.reconnect(node)
         } catch (e) {
@@ -82,6 +91,30 @@ export class ReconnectManager {
 
       throw error
     }
+  }
+
+  /**
+   * 等待指定毫秒数，但会提前唤醒如果节点被取消或节点已废弃
+   * @returns true 表示节点已被取消/废弃
+   */
+  private sleepOrCancel(ms: number, nodeId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      // 已在取消列表中
+      if (!this.reconnectAttempts.has(nodeId)) {
+        return resolve(true)
+      }
+      const timer = setTimeout(() => {
+        clearInterval(poll)
+        resolve(!this.reconnectAttempts.has(nodeId))
+      }, ms)
+      const poll = setInterval(() => {
+        if (!this.reconnectAttempts.has(nodeId)) {
+          clearTimeout(timer)
+          clearInterval(poll)
+          resolve(true)
+        }
+      }, 500)
+    })
   }
 
   /**

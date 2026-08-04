@@ -261,6 +261,25 @@ export class MonitorManager {
     }
   }
 
+  /**
+   * 清理指定节点的所有状态（用于节点被移除/删除时）
+   */
+  removeNodeStates(nodeId: string): void {
+    const nodeStates = this.states.get(nodeId)
+    if (nodeStates) {
+      // 清理所有防抖定时器，避免节点移除后定时器回调仍然触发
+      for (const state of nodeStates.values()) {
+        if (state.stopTimer) {
+          clearTimeout(state.stopTimer)
+          state.stopTimer = undefined
+        }
+      }
+      this.states.delete(nodeId)
+    }
+    this.nameIndex.delete(nodeId)
+    monitorLogger.debug(`已清理节点 ${nodeId} 的监控状态`)
+  }
+
   private cleanHistory(state: ContainerState, now: number) {
     const window = this.config.flappingWindow || 300000 // 默认 5分钟
     // 移除超出时间窗口的记录

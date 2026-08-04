@@ -73,6 +73,8 @@ export class DockerNode {
   private eventDedupMap: Map<string, number> = new Map()
   /** [新增] 实例唯一标识，用于判断是否存在多实例冲突 */
   private instanceId = Random.id(4)
+  /** [新增] 节点是否已被废弃（dispose 后置为 true），用于让 connect() 死循环退出 */
+  private disposed = false
 
   constructor(ctx: Context, config: NodeConfig, credential: CredentialConfig, debug = false) {
     this.ctx = ctx
@@ -106,6 +108,12 @@ export class DockerNode {
       return
     }
 
+    // 如果节点已经废弃（被 dispose），直接退出
+    if (this.disposed) {
+      nodeLogger.debug(`[${this.name}] 节点已废弃，跳过连接`)
+      return
+    }
+
     // 连接前先验证和清理配置
     this.validateAndCleanConfig()
 
@@ -115,6 +123,13 @@ export class DockerNode {
     const LONG_RETRY_INTERVAL = 60000  // 1 分钟
 
     while (true) {
+      // 每次循环都检查节点是否已被废弃
+      if (this.disposed) {
+        nodeLogger.info(`[${this.name}] 节点已废弃，停止连接循环`)
+        this.status = NodeStatus.DISCONNECTED
+        return
+      }
+
       attempt++
       const isInitialAttempts = attempt <= MAX_INITIAL_ATTEMPTS
       const currentInterval = isInitialAttempts ? RETRY_INTERVAL : LONG_RETRY_INTERVAL
@@ -180,11 +195,39 @@ export class DockerNode {
         this.connector = null
         this.dockerode = null // 确保清理
 
-        // 等待后重试
+        // 等待后重试（如果节点被废弃，中断等待立即退出循环）
         nodeLogger.debug(`[${this.name}] ${currentInterval / 1000} 秒后重试...`)
-        await new Promise(resolve => setTimeout(resolve, currentInterval))
+        if (await this.sleepOrDisposed(currentInterval)) {
+          nodeLogger.info(`[${this.name}] 节点已废弃，停止连接循环`)
+          this.status = NodeStatus.DISCONNECTED
+          return
+        }
       }
     }
+  }
+
+  /**
+   * 等待指定毫秒数，但如果节点被 dispose 则提前唤醒
+   * @returns true 表示节点已被废弃需要退出循环
+   */
+  private sleepOrDisposed(ms: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (this.disposed) {
+        return resolve(true)
+      }
+      const timer = setTimeout(() => {
+        clearInterval(poll)
+        resolve(this.disposed)
+      }, ms)
+      // 每 500ms 检查一次，如果节点被废弃立即唤醒
+      const poll = setInterval(() => {
+        if (this.disposed) {
+          clearTimeout(timer)
+          clearInterval(poll)
+          resolve(true)
+        }
+      }, 500)
+    })
   }
 
   /**
@@ -241,6 +284,9 @@ export class DockerNode {
    * 断开连接
    */
   async disconnect(): Promise<void> {
+    // 标记节点已废弃，让 connect() 循环立即退出
+    this.disposed = true
+
     this.stopMonitoring()
     this.clearTimers()
 
@@ -2534,6 +2580,8 @@ export class DockerNode {
   async dispose(): Promise<void> {
     await this.disconnect()
     this.eventCallbacks.clear()
+    // 已废弃标志置位（disconnect 内部已设置，这里冗余保险）
+    this.disposed = true
   }
 
   get name(): string { return this.config.name }

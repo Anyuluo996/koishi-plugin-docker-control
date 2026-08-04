@@ -356,6 +356,95 @@ export class DockerService {
     }
   }
 
+  /**
+   * 移除节点并彻底清理相关资源
+   * - 断开 SSH 连接、停止监控、清理事件回调
+   * - 取消该节点在 ReconnectManager 中的重连
+   * - 清空该节点在连接池中的所有连接
+   * - 通知 monitor 清理该节点的状态
+   *
+   * 返回 true 表示节点存在并已移除；false 表示节点不存在
+   */
+  async removeNode(nodeId: string): Promise<boolean> {
+    const node = this.nodes.get(nodeId)
+    if (!node) {
+      logger.debug(`removeNode: 节点 ${nodeId} 不存在，跳过`)
+      return false
+    }
+
+    logger.info(`移除节点 ${node.name} (${nodeId})，清理所有相关资源...`)
+
+    // 1. 取消该节点在 ReconnectManager 中的重连/重试
+    if (this.reconnectManager) {
+      try {
+        this.reconnectManager.cancel(nodeId)
+      } catch (e) {
+        logger.warn(`取消节点 ${nodeId} 重连时出错: ${(e as Error).message}`)
+      }
+    }
+
+    // 2. 释放在连接池中该节点的连接（如果有连接池使用的话）
+    // 注意：当前连接池的使用点在 connector 中通过私有方法管理，
+    // 这一步主要清空内部缓存池中残留的连接对象
+    try {
+      const pool: any = (this as any).connectionPool
+      if (pool && typeof pool.clearNode === 'function') {
+        await pool.clearNode(nodeId)
+      }
+    } catch (e) {
+      logger.warn(`清空节点 ${nodeId} 连接池时出错: ${(e as Error).message}`)
+    }
+
+    // 3. 断开节点（内部会 stopMonitoring、关闭 SSH、清理 dockerode）
+    try {
+      await node.dispose()
+    } catch (e) {
+      logger.warn(`断开节点 ${nodeId} 时出错: ${(e as Error).message}`)
+    }
+
+    // 4. 从 Map 中移除节点引用
+    this.nodes.delete(nodeId)
+
+    // 5. 通知 monitor 清理该节点的状态
+    try {
+      const monitor: any = (this as any).monitorManager
+      if (monitor && typeof monitor.removeNodeStates === 'function') {
+        monitor.removeNodeStates(nodeId)
+      }
+    } catch (e) {
+      logger.warn(`清理节点 ${nodeId} 监控状态时出错: ${(e as Error).message}`)
+    }
+
+    logger.info(`✅ 节点 ${node.name} (${nodeId}) 已移除`)
+    return true
+  }
+
+  /**
+   * 同步当前配置与已加载节点，移除配置中已不存在的节点
+   * @param newNodeConfigs 最新的节点配置列表
+   * @returns 被移除的节点 ID 列表
+   */
+  async syncNodesWithConfig(newNodeConfigs: NodeConfig[]): Promise<string[]> {
+    const newIds = new Set(newNodeConfigs.map(n => n.id))
+    const removedIds: string[] = []
+
+    for (const existingId of [...this.nodes.keys()]) {
+      if (!newIds.has(existingId)) {
+        removedIds.push(existingId)
+      }
+    }
+
+    for (const id of removedIds) {
+      await this.removeNode(id)
+    }
+
+    if (removedIds.length > 0) {
+      logger.info(`配置同步完成，已移除 ${removedIds.length} 个节点: ${removedIds.join(', ')}`)
+    }
+
+    return removedIds
+  }
+
   async stopAll(): Promise<void> {
     for (const node of this.nodes.values()) {
       await node.dispose()

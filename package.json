@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-docker-control",
   "description": "Koishi 插件 - 通过 SSH 控制 Docker 容器 (支持连接池、缓存、权限控制、审计日志)",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -11,7 +11,9 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc -w"
+    "dev": "tsc -w",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "chatbot",
@@ -37,6 +39,7 @@
   "devDependencies": {
     "@types/node": "^20.19.27",
     "@types/ssh2": "^1.15.5",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.4"
   }
 }

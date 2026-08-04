@@ -279,8 +279,62 @@ export function apply(ctx: Context, config: DockerControlConfig) {
     })
   }, 0)
 
+  // 将连接池/监控管理器引用挂到 dockerService 上，
+  // 这样 removeNode 可以同步清理这些资源
+  ;(dockerService as any).connectionPool = connectionPool
+  ;(dockerService as any).monitorManager = monitorManager
+
+  // 监听 Koishi 配置变更：当用户移除/修改节点时，移除已不存在的节点
+  // 防止删除节点配置后插件仍然继续连接
+  // 注意：Koishi 的 ctx.on('config') 回调不接受参数，且此事件在某些版本下不一定触发。
+  // 因此这里同时在 dispose/complete 时清理资源，并提供 docker.sync 手动指令。
+  let previousNodeIds: Set<string> = new Set(
+    (config.nodes || []).map((n: any) => n.id)
+  )
+  ctx.on('config', () => {
+    if (!dockerService) return
+    const currentNodes = config.nodes || []
+    const newIds = new Set<string>(currentNodes.map((n: any) => n.id))
+
+    // 移除配置中已不存在的节点
+    const removedIds: string[] = []
+    for (const id of previousNodeIds) {
+      if (!newIds.has(id)) {
+        removedIds.push(id)
+      }
+    }
+
+    if (removedIds.length > 0) {
+      logger.info(`检测到节点配置变更，移除 ${removedIds.length} 个已删除节点: ${removedIds.join(', ')}`)
+      for (const id of removedIds) {
+        dockerService.removeNode(id).catch((e: any) => {
+          logger.error(`移除节点 ${id} 失败: ${e?.message || e}`)
+        })
+      }
+    }
+
+    previousNodeIds = newIds
+  })
+
   // 注册基础指令
   registerCommands(ctx, () => dockerService, config)
+
+  // 手动同步节点（兜底方案，方便用户在不重启的情况下手动清理已删除节点）
+  ctx.command('docker.sync', '手动同步节点配置（移除已删除的节点）')
+    .alias('docker同步', '同步节点')
+    .action(async () => {
+      if (!dockerService) return 'Docker 服务未初始化'
+      try {
+        const removedIds = await dockerService.syncNodesWithConfig(config.nodes || [])
+        if (removedIds.length === 0) {
+          const all = dockerService.getAllNodes().map(n => n.name).join(', ') || '(无)'
+          return `✅ 当前没有需要同步的节点。已加载节点: ${all}`
+        }
+        return `✅ 已移除 ${removedIds.length} 个节点: ${removedIds.join(', ')}。\n注意：移除后该节点将不再自动连接。若要恢复，请重启插件。`
+      } catch (e: any) {
+        return `❌ 同步失败: ${e?.message || e}`
+      }
+    })
 
   // ==================== v0.1.0 系统监控指令 ====================
 
