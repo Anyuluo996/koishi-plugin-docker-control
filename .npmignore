@@ -1,0 +1,17 @@
+# 排除测试代码
+__tests__/
+src/__tests__/
+vitest.config.ts
+
+# 排除源码(只发布 lib/)
+src/
+
+# 排除临时文件和 symlink
+node_modules/
+*.log
+.DS_Store
+coverage/
+
+# 排除 tsconfig 和构建缓存
+tsconfig.json
+tsconfig.tsbuildinfo
